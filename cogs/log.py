@@ -8,21 +8,20 @@ import discord
 from discord import app_commands
 from discord.ext import commands, tasks
 from datetime import datetime, timezone
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Union
 
 try:
     import motor.motor_asyncio
 except ImportError:
     motor = None
 
-# Hardcoded authorized user IDs
-AUTHORIZED_USER_IDS = [947558109503692802, 1219266886143967245]
+AUTHORIZED_USER_IDS = [1219266886143967245, 1391931433521774742]
 
+PURPLE_COLOR = discord.Color.from_rgb(138, 43, 226)  # Theme color based on screenshot accent
 GREEN_COLOR = discord.Color.from_rgb(46, 139, 87)
 ORANGE_COLOR = discord.Color.from_rgb(211, 84, 0)
 RED_COLOR = discord.Color.from_rgb(192, 57, 43)
 BLUE_COLOR = discord.Color.from_rgb(41, 128, 185)
-PURPLE_COLOR = discord.Color.from_rgb(138, 43, 226)
 
 _mongo_client = None
 
@@ -40,7 +39,7 @@ def get_db():
         except Exception:
             return None
     try:
-        return _mongo_client["roblox_audit_logger"]
+        return _mongo_client["roblox_audit_logger_client2"]
     except Exception:
         return None
 
@@ -58,22 +57,27 @@ def extract_group_id(input_val: str) -> Optional[int]:
         return int(match.group(1))
     return None
 
-def format_footer_timestamp(dt: datetime) -> str:
-    """Formats date as: YYYY/MM/DD, HH:MM AM/PM"""
-    return dt.strftime("%Y/%m/%d, %I:%M %p")
+def format_footer_timestamp(dt: Optional[datetime] = None) -> str:
+    """Formats timestamp to match: TGE rank logs | YYYY/MM/DD, HH:MM AM/PM"""
+    if dt is None:
+        dt = datetime.now(timezone.utc)
+    date_str = dt.strftime("%Y/%m/%d, %I:%M %p")
+    return f"TGE rank logs | {date_str}"
 
 
-class RobloxAuditLogger(commands.Cog):
+class RobloxAuditLoggerClient2(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
         self.session: Optional[aiohttp.ClientSession] = None
         self.cycle_count: int = 0
         self.start_time: datetime = datetime.now(timezone.utc)
+        self.roles_cache: Dict[int, Dict[str, Any]] = {}  # {group_id: {"timestamp": float, "roles": list}}
         self.poll_logs_task.start()
 
     def cog_unload(self):
         self.poll_logs_task.cancel()
 
+    # Listener for when the bot is pinged/mentioned (1 in 10 chance)
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
         if message.author.bot:
@@ -103,7 +107,8 @@ class RobloxAuditLogger(commands.Cog):
             self.session = aiohttp.ClientSession(headers=headers, cookies=cookies, timeout=timeout)
         return self.session
 
-    async def _safe_fetch_json(self, url: str, max_retries: int = 5) -> Optional[Dict[str, Any]]:
+    async def _safe_fetch_json(self, url: str, max_retries: int = 3) -> Optional[Dict[str, Any]]:
+        """Fetches JSON with exponential backoff for handling Roblox rate limits."""
         session = await self.get_http_session()
         for attempt in range(max_retries):
             try:
@@ -111,25 +116,34 @@ class RobloxAuditLogger(commands.Cog):
                     if resp.status == 200:
                         return await resp.json()
                     elif resp.status == 429:
-                        await asyncio.sleep(1.0 * (attempt + 1))
+                        await asyncio.sleep(2.0 * (attempt + 1))
                         continue
                     elif resp.status in [500, 502, 503, 504]:
-                        await asyncio.sleep(0.4 * (2 ** attempt))
+                        await asyncio.sleep(0.5 * (2 ** attempt))
                         continue
                     else:
                         return None
             except Exception:
                 if attempt == max_retries - 1:
                     return None
-                await asyncio.sleep(0.4 * (2 ** attempt))
+                await asyncio.sleep(0.5 * (2 ** attempt))
         return None
 
     async def _fetch_group_roles(self, group_id: int) -> List[Dict[str, Any]]:
+        """Fetches roles with a 1-hour cache to save bandwidth."""
+        now = time.time()
+        if group_id in self.roles_cache:
+            cache_entry = self.roles_cache[group_id]
+            if now - cache_entry["timestamp"] < 3600:  # 1 hour TTL
+                return cache_entry["roles"]
+
         roles_url = f"https://groups.roblox.com/v1/groups/{group_id}/roles"
-        data = await self._safe_fetch_json(roles_url, max_retries=5)
+        data = await self._safe_fetch_json(roles_url, max_retries=3)
         if data and "roles" in data:
-            return data["roles"]
-        return []
+            roles = data["roles"]
+            self.roles_cache[group_id] = {"timestamp": now, "roles": roles}
+            return roles
+        return self.roles_cache.get(group_id, {}).get("roles", [])
 
     async def _fetch_filtered_group_members(self, group_id: int, min_rank_val: int = 0) -> tuple[Dict[str, Dict[str, Any]], bool]:
         roles = await self._fetch_group_roles(group_id)
@@ -149,7 +163,10 @@ class RobloxAuditLogger(commands.Cog):
             role_rank = role.get("rank")
             
             cursor = ""
-            while True:
+            pages_fetched = 0
+            max_pages = 2  # Hard cap: limit to 200 members per role to preserve bandwidth
+
+            while pages_fetched < max_pages:
                 members_url = (
                     f"https://groups.roblox.com/v1/groups/{group_id}/roles/{role_id}/users"
                     f"?limit=100&sortOrder=Desc"
@@ -157,7 +174,7 @@ class RobloxAuditLogger(commands.Cog):
                 if cursor:
                     members_url += f"&cursor={cursor}"
 
-                m_data = await self._safe_fetch_json(members_url, max_retries=3)
+                m_data = await self._safe_fetch_json(members_url, max_retries=2)
                 if m_data is None:
                     all_pages_succeeded = False
                     break
@@ -171,10 +188,11 @@ class RobloxAuditLogger(commands.Cog):
                     }
 
                 cursor = m_data.get("nextPageCursor")
+                pages_fetched += 1
                 if not cursor:
                     break
                 
-                await asyncio.sleep(0.1)
+                await asyncio.sleep(0.2)
 
         return member_map, all_pages_succeeded
 
@@ -212,7 +230,7 @@ class RobloxAuditLogger(commands.Cog):
 
         try:
             group_url = f"https://groups.roblox.com/v1/groups/{group_id}"
-            group_data = await self._safe_fetch_json(group_url, max_retries=5)
+            group_data = await self._safe_fetch_json(group_url, max_retries=3)
             if not group_data:
                 return await interaction.followup.send(
                     embed=discord.Embed(title="Invalid Roblox Group", description=f"Group ID `{group_id}` could not be retrieved from Roblox.", color=RED_COLOR),
@@ -313,6 +331,10 @@ class RobloxAuditLogger(commands.Cog):
                 ephemeral=is_ephemeral
             )
 
+    # ====================================================================
+    # Slash Commands
+    # ====================================================================
+
     @app_commands.command(
         name="ping",
         description="View system latency, uptime, database status, and tracking overview."
@@ -353,12 +375,12 @@ class RobloxAuditLogger(commands.Cog):
 
         embed = discord.Embed(
             title="System Status Overview",
-            color=BLUE_COLOR,
+            color=PURPLE_COLOR,
             timestamp=now
         )
 
         embed.add_field(
-            name="## Latency",
+            name="Latency",
             value=(
                 f"Gateway Ping: `{gateway_ms} ms`\n"
                 f"Response Time: `{response_ms} ms`\n"
@@ -368,7 +390,7 @@ class RobloxAuditLogger(commands.Cog):
         )
 
         embed.add_field(
-            name="## System Health",
+            name="System Health",
             value=(
                 f"Database: `{db_status}`\n"
                 f"Uptime: `{uptime_str}`\n"
@@ -378,7 +400,7 @@ class RobloxAuditLogger(commands.Cog):
         )
 
         embed.add_field(
-            name="## Tracking Stats",
+            name="Tracking Stats",
             value=(
                 f"Tracked Groups: `{total_groups}`\n"
                 f"Total Servers: `{len(self.bot.guilds)}`\n"
@@ -387,7 +409,7 @@ class RobloxAuditLogger(commands.Cog):
             inline=False
         )
 
-        embed.set_footer(text=self.bot.user.name if self.bot.user else "TGE Logs Bot")
+        embed.set_footer(text=format_footer_timestamp(now))
         await interaction.followup.send(embed=embed, ephemeral=not visible)
 
     @app_commands.command(
@@ -403,9 +425,9 @@ class RobloxAuditLogger(commands.Cog):
             )
 
         embed = discord.Embed(
-            title="Roblox Group Logger - Usage & Optimization Guide",
+            title="TGE Logs - Usage & Optimization Guide",
             description="Use the commands below to configure and monitor Roblox group audit events.",
-            color=BLUE_COLOR
+            color=PURPLE_COLOR
         )
 
         embed.add_field(
@@ -428,14 +450,14 @@ class RobloxAuditLogger(commands.Cog):
         embed.add_field(
             name="Optimization Advice (Large Groups 1,000+ Members)",
             value=(
-                "- **Avoid using `/setup` on massive groups** without a cookie attached.\n"
-                "- **Use `/rank-setup` instead**: Set `min_rank_name` to a stable staff rank.\n"
-                "- **Case-Insensitive Exact Names**: Type the exact rank title as shown on Roblox."
+                "- **Avoid using `/setup` on massive groups** without a cookie attached. Fetching thousands of bottom-rank members triggers Roblox API rate limits.\n"
+                "- **Use `/rank-setup` instead**: Set `min_rank_name` to a stable staff or middle-tier rank (or a low rank that doesn't constantly change).\n"
+                "- **Case-Insensitive Exact Names**: When entering `min_rank_name`, type the exact rank title as shown on Roblox."
             ),
             inline=False
         )
 
-        embed.set_footer(text=self.bot.user.name if self.bot.user else "TGE Logs Bot")
+        embed.set_footer(text=format_footer_timestamp())
         await interaction.response.send_message(embed=embed, ephemeral=not visible)
 
     @app_commands.command(
@@ -533,11 +555,15 @@ class RobloxAuditLogger(commands.Cog):
         embed = discord.Embed(
             title="Server Group Log Configurations",
             description="\n".join(lines) if lines else "*(No active group setups)*",
-            color=BLUE_COLOR
+            color=PURPLE_COLOR
         )
         await interaction.followup.send(embed=embed, ephemeral=not visible)
 
-    @tasks.loop(seconds=2.0)
+    # ====================================================================
+    # Background Poller Loop (~30.0s Interval to save bandwidth)
+    # ====================================================================
+
+    @tasks.loop(seconds=30.0)
     async def poll_logs_task(self):
         await self.bot.wait_until_ready()
         try:
@@ -566,7 +592,8 @@ class RobloxAuditLogger(commands.Cog):
                 if mode == "audit_log":
                     await self.poll_audit_log_mode(db, session, cfg, channel, group_id, group_name, min_rank_val)
                 else:
-                    if self.cycle_count % 5 == 0:
+                    # Execute public polling only every 10 cycles (~5 minutes)
+                    if self.cycle_count % 10 == 0:
                         asyncio.create_task(self.poll_public_mode(db, cfg, channel, group_id, group_name, min_rank_val))
 
         except Exception:
@@ -623,7 +650,7 @@ class RobloxAuditLogger(commands.Cog):
                 return
 
             now_dt = datetime.now(timezone.utc)
-            time_str = format_footer_timestamp(now_dt)
+            footer_str = format_footer_timestamp(now_dt)
             group_link = f"[{group_name}](https://www.roblox.com/groups/{group_id})"
 
             for uid, info in current_members.items():
@@ -635,13 +662,13 @@ class RobloxAuditLogger(commands.Cog):
                     if user_rank >= min_rank_val:
                         embed = discord.Embed(
                             title="Group Join",
-                            description=f"# There has been a new member\n\n{target_user} joined the group",
+                            description=f"There has been a new join\n\n{target_user} joined as `{info['role_name']}`",
                             color=PURPLE_COLOR
                         )
                         embed.add_field(name="Username", value=target_link, inline=False)
                         embed.add_field(name="Group", value=group_link, inline=False)
-                        embed.add_field(name="Rank", value=info["role_name"], inline=False)
-                        embed.set_footer(text=f"TGE rank logs | {time_str}")
+                        embed.add_field(name="New rank", value=info["role_name"], inline=False)
+                        embed.set_footer(text=footer_str)
                         try:
                             await channel.send(embed=embed)
                         except Exception:
@@ -653,22 +680,24 @@ class RobloxAuditLogger(commands.Cog):
                     if old_info["role_name"] != info["role_name"]:
                         if user_rank >= min_rank_val or old_rank_num >= min_rank_val:
                             if user_rank < old_rank_num:
-                                title_text = "Demotion"
-                                desc_text = f"# There has been a demotion\n\n{target_user} was demoted to `{info['role_name']}`"
+                                title = "Demotion"
+                                headline = "There has been a demotion"
+                                action_str = f"{target_user} was demoted to `{info['role_name']}`"
                             else:
-                                title_text = "Promotion"
-                                desc_text = f"# There has been a promotion\n\n{target_user} was promoted to `{info['role_name']}`"
+                                title = "Promotion"
+                                headline = "There has been a promotion"
+                                action_str = f"{target_user} was promoted to `{info['role_name']}`"
 
                             embed = discord.Embed(
-                                title=title_text,
-                                description=desc_text,
+                                title=title,
+                                description=f"{headline}\n\n{action_str}",
                                 color=PURPLE_COLOR
                             )
                             embed.add_field(name="Username", value=target_link, inline=False)
                             embed.add_field(name="Group", value=group_link, inline=False)
                             embed.add_field(name="Old rank", value=old_info["role_name"], inline=False)
                             embed.add_field(name="New rank", value=info["role_name"], inline=False)
-                            embed.set_footer(text=f"TGE rank logs | {time_str}")
+                            embed.set_footer(text=footer_str)
                             try:
                                 await channel.send(embed=embed)
                             except Exception:
@@ -680,14 +709,14 @@ class RobloxAuditLogger(commands.Cog):
                         target_user = old_info.get("username", f"User {uid}")
                         target_link = f"[{target_user}](https://www.roblox.com/users/{uid}/profile)"
                         embed = discord.Embed(
-                            title="Group Leave",
-                            description=f"# There has been a leave/exile\n\n{target_user} left or was exiled",
+                            title="Exile",
+                            description=f"There has been an exile or leave\n\n{target_user} left the group",
                             color=PURPLE_COLOR
                         )
                         embed.add_field(name="Username", value=target_link, inline=False)
                         embed.add_field(name="Group", value=group_link, inline=False)
-                        embed.add_field(name="Last rank", value=old_info.get("role_name", "Unknown"), inline=False)
-                        embed.set_footer(text=f"TGE rank logs | {time_str}")
+                        embed.add_field(name="Old rank", value=old_info.get("role_name", "Unknown"), inline=False)
+                        embed.set_footer(text=footer_str)
                         try:
                             await channel.send(embed=embed)
                         except Exception:
@@ -707,20 +736,20 @@ class RobloxAuditLogger(commands.Cog):
         description = entry.get("description", {})
         created_dt = entry.get("created")
 
-        now_dt = datetime.now(timezone.utc)
+        event_dt = datetime.now(timezone.utc)
         if created_dt:
             try:
-                now_dt = datetime.fromisoformat(created_dt.replace("Z", "+00:00"))
+                event_dt = datetime.fromisoformat(created_dt.replace("Z", "+00:00"))
             except Exception:
                 pass
 
-        time_str = format_footer_timestamp(now_dt)
+        footer_str = format_footer_timestamp(event_dt)
         group_link = f"[{group_name}](https://www.roblox.com/groups/{group_id})"
 
         if action_type in ["Change Rank", "Promote Member", "Demote Member"]:
             target_user = description.get("TargetHeader", description.get("TargetName", "Target User"))
             target_id = description.get("TargetId")
-            target_link = f"[{target_user}](https://www.roblox.com/users/{target_id}/profile)" if target_id else f"{target_user}"
+            target_link = f"[{target_user}](https://www.roblox.com/users/{target_id}/profile)" if target_id else f"**{target_user}**"
 
             old_role = description.get("OldRoleSetHeader", description.get("OldRoleSetName", "Unknown"))
             new_role = description.get("NewRoleSetHeader", description.get("NewRoleSetName", "Unknown"))
@@ -732,26 +761,29 @@ class RobloxAuditLogger(commands.Cog):
             if new_rank_num < min_rank_val and old_rank_num < min_rank_val:
                 return
 
-            if action_type == "Demote Member" or new_rank_num < old_rank_num:
-                title_text = "Demotion"
-                desc_text = f"# There has been a demotion\n\n{target_user} was demoted to `{new_role}`"
-            elif action_type == "Promote Member" or new_rank_num > old_rank_num:
-                title_text = "Promotion"
-                desc_text = f"# There has been a promotion\n\n{target_user} was promoted to `{new_role}`"
+            if action_type == "Demote Member" or (new_rank_num < old_rank_num):
+                title = "Demotion"
+                headline = "There has been a demotion"
+                action_str = f"{target_user} was demoted to `{new_role}`"
+            elif action_type == "Promote Member" or (new_rank_num > old_rank_num):
+                title = "Promotion"
+                headline = "There has been a promotion"
+                action_str = f"{target_user} was promoted to `{new_role}`"
             else:
-                title_text = "Rank Change"
-                desc_text = f"# There has been a rank change\n\n{target_user}'s rank was changed to `{new_role}`"
+                title = "Rank Change"
+                headline = "There has been a rank change"
+                action_str = f"{target_user}'s rank was changed to `{new_role}`"
 
             embed = discord.Embed(
-                title=title_text,
-                description=desc_text,
+                title=title,
+                description=f"{headline}\n\n{action_str}",
                 color=PURPLE_COLOR
             )
             embed.add_field(name="Username", value=target_link, inline=False)
             embed.add_field(name="Group", value=group_link, inline=False)
             embed.add_field(name="Old rank", value=old_role, inline=False)
             embed.add_field(name="New rank", value=new_role, inline=False)
-            embed.set_footer(text=f"TGE rank logs | {time_str}")
+            embed.set_footer(text=footer_str)
 
             try:
                 await channel.send(embed=embed)
@@ -768,17 +800,17 @@ class RobloxAuditLogger(commands.Cog):
 
             target_user = description.get("TargetHeader", description.get("TargetName", actor_name))
             target_id = description.get("TargetId", actor_id)
-            target_link = f"[{target_user}](https://www.roblox.com/users/{target_id}/profile)" if target_id else f"{target_user}"
+            target_link = f"[{target_user}](https://www.roblox.com/users/{target_id}/profile)" if target_id else f"**{target_user}**"
 
             embed = discord.Embed(
                 title="Group Join",
-                description=f"# There has been a new member\n\n{target_user} joined the group",
+                description=f"There has been a new join\n\n{target_user} joined as `{role_name}`",
                 color=PURPLE_COLOR
             )
             embed.add_field(name="Username", value=target_link, inline=False)
             embed.add_field(name="Group", value=group_link, inline=False)
-            embed.add_field(name="Rank", value=role_name, inline=False)
-            embed.set_footer(text=f"TGE rank logs | {time_str}")
+            embed.add_field(name="New rank", value=role_name, inline=False)
+            embed.set_footer(text=footer_str)
 
             try:
                 await channel.send(embed=embed)
@@ -791,16 +823,16 @@ class RobloxAuditLogger(commands.Cog):
 
             target_user = description.get("TargetHeader", description.get("TargetName", "Target User"))
             target_id = description.get("TargetId")
-            target_link = f"[{target_user}](https://www.roblox.com/users/{target_id}/profile)" if target_id else f"{target_user}"
+            target_link = f"[{target_user}](https://www.roblox.com/users/{target_id}/profile)" if target_id else f"**{target_user}**"
 
             embed = discord.Embed(
                 title="Exile",
-                description=f"# There has been an exile\n\n{target_user} was exiled from the group",
+                description=f"There has been an exile\n\n{target_user} was exiled",
                 color=PURPLE_COLOR
             )
             embed.add_field(name="Username", value=target_link, inline=False)
             embed.add_field(name="Group", value=group_link, inline=False)
-            embed.set_footer(text=f"TGE rank logs | {time_str}")
+            embed.set_footer(text=footer_str)
 
             try:
                 await channel.send(embed=embed)
@@ -812,13 +844,13 @@ class RobloxAuditLogger(commands.Cog):
                 return
 
             embed = discord.Embed(
-                title="Audit Action",
-                description=f"# Action Performed\n\n`{action_type}` was triggered",
+                title="Group Activity",
+                description=f"An activity occurred in the group\n\n**Action**: `{action_type}`",
                 color=PURPLE_COLOR
             )
             embed.add_field(name="Performer", value=f"[{actor_name}](https://www.roblox.com/users/{actor_id}/profile)" if actor_id else actor_name, inline=False)
             embed.add_field(name="Group", value=group_link, inline=False)
-            embed.set_footer(text=f"TGE rank logs | {time_str}")
+            embed.set_footer(text=footer_str)
 
             try:
                 await channel.send(embed=embed)
@@ -827,5 +859,4 @@ class RobloxAuditLogger(commands.Cog):
 
 
 async def setup(bot: commands.Bot):
-    await bot.add_cog(RobloxAuditLogger(bot))
-
+    await bot.add_cog(RobloxAuditLoggerClient2(bot))
