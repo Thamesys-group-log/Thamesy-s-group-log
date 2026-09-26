@@ -17,9 +17,12 @@ except ImportError:
 
 AUTHORIZED_USER_IDS = {947558109503692802, 1219266886143967245, 1391931433521774742}
 
+# Color Definitions for Client 2
 PURPLE_COLOR = discord.Color.from_rgb(138, 43, 226)
-GREEN_COLOR = discord.Color.from_rgb(46, 139, 87)
-RED_COLOR = discord.Color.from_rgb(192, 57, 43)
+GREEN_COLOR = discord.Color.from_rgb(46, 204, 113)      # Group Join (Green)
+LIGHT_GREEN_COLOR = discord.Color.from_rgb(114, 213, 114) # Promotion (Light Green)
+YELLOW_COLOR = discord.Color.from_rgb(241, 196, 15)     # Demotion (Yellow)
+RED_COLOR = discord.Color.from_rgb(231, 76, 60)        # Exile / Leave (Red)
 
 _mongo_client = None
 
@@ -665,7 +668,7 @@ class RobloxAuditLoggerClient2(commands.Cog):
                         embed = discord.Embed(
                             title="Group Join",
                             description=f"There has been a new join\n\n{target_user} joined as `{info['role_name']}`",
-                            color=PURPLE_COLOR
+                            color=GREEN_COLOR
                         )
                         embed.add_field(name="Username", value=target_link, inline=False)
                         embed.add_field(name="Group", value=group_link, inline=False)
@@ -681,19 +684,23 @@ class RobloxAuditLoggerClient2(commands.Cog):
 
                     if old_info["role_name"] != info["role_name"]:
                         if user_rank >= min_rank_val or old_rank_num >= min_rank_val:
-                            if user_rank < old_rank_num:
+                            is_demotion = user_rank < old_rank_num
+                            
+                            if is_demotion:
                                 title = "Demotion"
                                 headline = "There has been a demotion"
                                 action_str = f"{target_user} was demoted to `{info['role_name']}`"
+                                embed_color = YELLOW_COLOR
                             else:
                                 title = "Promotion"
                                 headline = "There has been a promotion"
                                 action_str = f"{target_user} was promoted to `{info['role_name']}`"
+                                embed_color = LIGHT_GREEN_COLOR
 
                             embed = discord.Embed(
                                 title=title,
                                 description=f"{headline}\n\n{action_str}",
-                                color=PURPLE_COLOR
+                                color=embed_color
                             )
                             embed.add_field(name="Username", value=target_link, inline=False)
                             embed.add_field(name="Group", value=group_link, inline=False)
@@ -701,7 +708,9 @@ class RobloxAuditLoggerClient2(commands.Cog):
                             embed.add_field(name="New rank", value=info["role_name"], inline=False)
                             embed.set_footer(text=footer_str)
                             try:
-                                await channel.send(embed=embed)
+                                msg = await channel.send(embed=embed)
+                                if not is_demotion:
+                                    await msg.add_reaction("🎉")
                             except Exception:
                                 pass
 
@@ -713,7 +722,7 @@ class RobloxAuditLoggerClient2(commands.Cog):
                         embed = discord.Embed(
                             title="Exile",
                             description=f"There has been an exile or leave\n\n{target_user} left the group",
-                            color=PURPLE_COLOR
+                            color=RED_COLOR
                         )
                         embed.add_field(name="Username", value=target_link, inline=False)
                         embed.add_field(name="Group", value=group_link, inline=False)
@@ -763,23 +772,28 @@ class RobloxAuditLoggerClient2(commands.Cog):
             if new_rank_num < min_rank_val and old_rank_num < min_rank_val:
                 return
 
+            is_promotion = False
             if action_type == "Demote Member" or (new_rank_num < old_rank_num):
                 title = "Demotion"
                 headline = "There has been a demotion"
                 action_str = f"{target_user} was demoted to `{new_role}`"
+                embed_color = YELLOW_COLOR
             elif action_type == "Promote Member" or (new_rank_num > old_rank_num):
                 title = "Promotion"
                 headline = "There has been a promotion"
                 action_str = f"{target_user} was promoted to `{new_role}`"
+                embed_color = LIGHT_GREEN_COLOR
+                is_promotion = True
             else:
                 title = "Rank Change"
                 headline = "There has been a rank change"
                 action_str = f"{target_user}'s rank was changed to `{new_role}`"
+                embed_color = PURPLE_COLOR
 
             embed = discord.Embed(
                 title=title,
                 description=f"{headline}\n\n{action_str}",
-                color=PURPLE_COLOR
+                color=embed_color
             )
             embed.add_field(name="Username", value=target_link, inline=False)
             embed.add_field(name="Group", value=group_link, inline=False)
@@ -788,7 +802,9 @@ class RobloxAuditLoggerClient2(commands.Cog):
             embed.set_footer(text=footer_str)
 
             try:
-                await channel.send(embed=embed)
+                msg = await channel.send(embed=embed)
+                if is_promotion:
+                    await msg.add_reaction("🎉")
             except Exception:
                 pass
 
@@ -807,7 +823,7 @@ class RobloxAuditLoggerClient2(commands.Cog):
             embed = discord.Embed(
                 title="Group Join",
                 description=f"There has been a new join\n\n{target_user} joined as `{role_name}`",
-                color=PURPLE_COLOR
+                color=GREEN_COLOR
             )
             embed.add_field(name="Username", value=target_link, inline=False)
             embed.add_field(name="Group", value=group_link, inline=False)
@@ -830,7 +846,7 @@ class RobloxAuditLoggerClient2(commands.Cog):
             embed = discord.Embed(
                 title="Exile",
                 description=f"There has been an exile\n\n{target_user} was exiled",
-                color=PURPLE_COLOR
+                color=RED_COLOR
             )
             embed.add_field(name="Username", value=target_link, inline=False)
             embed.add_field(name="Group", value=group_link, inline=False)
