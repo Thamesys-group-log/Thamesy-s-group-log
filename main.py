@@ -4,11 +4,6 @@ import discord
 from discord.ext import commands
 from keep_alive import keep_alive
 
-# Start flask server to keep host alive
-keep_alive()
-
-TOKEN = os.getenv("DISCORD_TOKEN")
-
 intents = discord.Intents.default()
 intents.message_content = True
 intents.guilds = True
@@ -19,19 +14,18 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 async def on_ready():
     print(f"Logged in as {bot.user} (ID: {bot.user.id})")
     try:
+        if not bot.get_cog("TGE Logs"):
+            await bot.load_extension("cogs.log")
+        
         synced = await bot.tree.sync()
-        print(f"Synced {len(synced)} slash command(s).")
+        print(f"Synced {len(synced)} slash commands globally.")
     except Exception as e:
-        print(f"Failed to sync slash commands: {e}")
-
-async def main():
-    async with bot:
-        # Load the cog inside cogs/log.py
-        await bot.load_extension("cogs.log")
-        await bot.start(TOKEN)
+        print(f"Error loading cogs or syncing commands: {e}")
 
 if __name__ == "__main__":
-    if not TOKEN:
-        raise ValueError("DISCORD_TOKEN environment variable is not set.")
-    asyncio.run(main())
-
+    token = os.getenv("TOKEN")
+    if not token:
+        print("Error: 'TOKEN' environment variable is missing.")
+    else:
+        keep_alive(bot)
+        bot.run(token)
