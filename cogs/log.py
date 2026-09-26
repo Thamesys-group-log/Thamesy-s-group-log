@@ -8,20 +8,18 @@ import discord
 from discord import app_commands
 from discord.ext import commands, tasks
 from datetime import datetime, timezone
-from typing import Optional, Dict, Any, List, Union
+from typing import Optional, Dict, Any, List
 
 try:
     import motor.motor_asyncio
 except ImportError:
     motor = None
 
-AUTHORIZED_USER_IDS = [947558109503692802, 1219266886143967245, 1391931433521774742]
+AUTHORIZED_USER_IDS = {947558109503692802, 1219266886143967245, 1391931433521774742}
 
 PURPLE_COLOR = discord.Color.from_rgb(138, 43, 226)
 GREEN_COLOR = discord.Color.from_rgb(46, 139, 87)
-ORANGE_COLOR = discord.Color.from_rgb(211, 84, 0)
 RED_COLOR = discord.Color.from_rgb(192, 57, 43)
-BLUE_COLOR = discord.Color.from_rgb(41, 128, 185)
 
 _mongo_client = None
 
@@ -52,7 +50,6 @@ def extract_group_id(input_val: str) -> Optional[int]:
         return None
     
     clean_input = re.sub(r"[^\d]", " ", str(input_val)).strip()
-    
     match = re.search(r"(\d+)", clean_input)
     if match:
         try:
@@ -63,11 +60,11 @@ def extract_group_id(input_val: str) -> Optional[int]:
     return None
 
 def format_footer_timestamp(dt: Optional[datetime] = None) -> str:
-    """Formats timestamp to match: TGE rank logs | YYYY/MM/DD, HH:MM AM/PM"""
+    """Formats timestamp to match: TGE Logs | YYYY/MM/DD, HH:MM AM/PM"""
     if dt is None:
         dt = datetime.now(timezone.utc)
     date_str = dt.strftime("%Y/%m/%d, %I:%M %p")
-    return f"TGE rank logs | {date_str}"
+    return f"TGE Logs | {date_str}"
 
 
 class RobloxAuditLoggerClient2(commands.Cog):
@@ -322,7 +319,7 @@ class RobloxAuditLoggerClient2(commands.Cog):
             rank_filter_info = f"**Minimum Rank**: `{selected_role_name}` (Rank {min_rank_value}+)\n" if selected_role_name else "**Minimum Rank**: `All Ranks (0+)`\n"
 
             embed = discord.Embed(
-                title="Roblox Group Logger Configured",
+                title="TGE Logs Configured",
                 description=(
                     f"**Group**: [{group_name}](https://www.roblox.com/groups/{group_id})\n"
                     f"**Group ID**: `{group_id}`\n"
@@ -333,6 +330,7 @@ class RobloxAuditLoggerClient2(commands.Cog):
                 ),
                 color=GREEN_COLOR
             )
+            embed.set_footer(text=format_footer_timestamp())
             await interaction.followup.send(embed=embed, ephemeral=is_ephemeral)
 
         except Exception as e:
@@ -435,7 +433,7 @@ class RobloxAuditLoggerClient2(commands.Cog):
             )
 
         embed = discord.Embed(
-            title="TGE Logs - Usage & Optimization Guide",
+            title="TGE Logs - Usage Guide",
             description="Use the commands below to configure and monitor Roblox group audit events.",
             color=PURPLE_COLOR
         )
@@ -462,7 +460,7 @@ class RobloxAuditLoggerClient2(commands.Cog):
 
     @app_commands.command(
         name="setup",
-        description="Setup Roblox Group activity logging for ALL ranks (Authorized Owners Only)."
+        description="Setup Roblox Group activity logging for ALL ranks."
     )
     @app_commands.describe(
         channel="The text channel where logs should be sent",
@@ -485,7 +483,7 @@ class RobloxAuditLoggerClient2(commands.Cog):
     @app_commands.describe(
         channel="The text channel where logs should be sent",
         group="The Roblox Group ID or full Group Link to track",
-        min_rank_name="The exact rank name to start logging from (e.g. Officer)",
+        min_rank_name="The exact rank name to start logging from",
         visible="Set to True to make the response visible to everyone (default: False)."
     )
     async def rank_setup_cmd(
@@ -500,7 +498,7 @@ class RobloxAuditLoggerClient2(commands.Cog):
 
     @app_commands.command(
         name="remove-setup",
-        description="Remove a Roblox Group audit setup from this server (Authorized Owners Only)."
+        description="Remove a Roblox Group audit setup from this server."
     )
     @app_commands.describe(
         group="The Roblox Group ID or full Group Link to untrack",
@@ -522,13 +520,17 @@ class RobloxAuditLoggerClient2(commands.Cog):
 
         res = await db["group_configs"].delete_one({"guild_id": str(interaction.guild.id), "group_id": group_id})
         if res.deleted_count > 0:
-            await interaction.followup.send(embed=discord.Embed(title="Setup Removed", description=f"Stopped tracking Group ID `{group_id}`.", color=GREEN_COLOR), ephemeral=not visible)
+            embed = discord.Embed(title="Setup Removed", description=f"Stopped tracking Group ID `{group_id}`.", color=GREEN_COLOR)
+            embed.set_footer(text=format_footer_timestamp())
+            await interaction.followup.send(embed=embed, ephemeral=not visible)
         else:
-            await interaction.followup.send(embed=discord.Embed(title="Not Found", description=f"No configuration found for Group ID `{group_id}`.", color=RED_COLOR), ephemeral=not visible)
+            embed = discord.Embed(title="Not Found", description=f"No configuration found for Group ID `{group_id}`.", color=RED_COLOR)
+            embed.set_footer(text=format_footer_timestamp())
+            await interaction.followup.send(embed=embed, ephemeral=not visible)
 
     @app_commands.command(
         name="list-setups",
-        description="List active group configurations (Authorized Owners Only)."
+        description="List active group configurations."
     )
     @app_commands.describe(visible="Set to True to make the response visible to everyone (default: False).")
     async def list_setups_cmd(self, interaction: discord.Interaction, visible: bool = False):
@@ -553,14 +555,15 @@ class RobloxAuditLoggerClient2(commands.Cog):
             lines.append(f"- [{g_name}](https://www.roblox.com/groups/{g_id}) (`{g_id}`) -> <#{ch_id}> [{mode} | Min Rank: {min_r}]")
 
         embed = discord.Embed(
-            title="Server Group Log Configurations",
+            title="TGE Logs - Server Configurations",
             description="\n".join(lines) if lines else "*(No active group setups)*",
             color=PURPLE_COLOR
         )
+        embed.set_footer(text=format_footer_timestamp())
         await interaction.followup.send(embed=embed, ephemeral=not visible)
 
     # ====================================================================
-    # Background Poller Loop (~30.0s Interval to save bandwidth)
+    # Background Poller Loop (~30.0s Interval)
     # ====================================================================
 
     @tasks.loop(seconds=30.0)
@@ -816,7 +819,7 @@ class RobloxAuditLoggerClient2(commands.Cog):
             except Exception:
                 pass
 
-        elif action_type == "Exil Member":
+        elif action_type in ["Remove Member", "Exile Member"]:
             if min_rank_val > 0:
                 return
 
@@ -858,4 +861,4 @@ class RobloxAuditLoggerClient2(commands.Cog):
 
 
 async def setup(bot: commands.Bot):
-    await bot.add_cog(TGE Logs(bot))
+    await bot.add_cog(RobloxAuditLoggerClient2(bot))
