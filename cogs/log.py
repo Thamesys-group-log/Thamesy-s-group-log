@@ -15,7 +15,7 @@ try:
 except ImportError:
     motor = None
 
-AUTHORIZED_USER_IDS = [1219266886143967245, 1391931433521774742]
+AUTHORIZED_USER_IDS = [1219266886143967245, 947558109503692802 ]
 
 PURPLE_COLOR = discord.Color.from_rgb(138, 43, 226)  # Theme color based on screenshot accent
 GREEN_COLOR = discord.Color.from_rgb(46, 139, 87)
