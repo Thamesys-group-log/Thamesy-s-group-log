@@ -22,12 +22,11 @@ WORKER_URL = "https://roblox-audit-proxy.madefordiscordbot.workers.dev"
 
 AUTHORIZED_USER_IDS = {947558109503692802, 1219266886143967245, 1391931433521774742}
 
-# Color Definitions for Client 2
-PURPLE_COLOR = discord.Color.from_rgb(138, 43, 226)
-GREEN_COLOR = discord.Color.from_rgb(46, 204, 113)        # Group Join (Green)
-LIGHT_GREEN_COLOR = discord.Color.from_rgb(114, 213, 114) # Promotion (Light Green)
-YELLOW_COLOR = discord.Color.from_rgb(241, 196, 15)       # Demotion (Yellow)
-RED_COLOR = discord.Color.from_rgb(231, 76, 60)          # Exile / Leave (Red)
+# Color Definitions for Client 2 (Updated Color Mapping)
+GREEN_COLOR = discord.Color.from_rgb(46, 204, 113)   # Group Join (Green)
+YELLOW_COLOR = discord.Color.from_rgb(241, 196, 15)  # Promotion (Yellow)
+PURPLE_COLOR = discord.Color.from_rgb(138, 43, 226)  # Demotion / General Activity (Purple)
+RED_COLOR = discord.Color.from_rgb(231, 76, 60)     # Exile / Kick / Leave (Red)
 
 _mongo_client = None
 
@@ -741,12 +740,12 @@ class RobloxAuditLoggerClient2(commands.Cog):
                                 title = "Demotion"
                                 headline = "There has been a demotion"
                                 action_str = f"{target_user} was demoted to `{info['role_name']}`"
-                                embed_color = YELLOW_COLOR
+                                embed_color = PURPLE_COLOR
                             else:
                                 title = "Promotion"
                                 headline = "There has been a promotion"
                                 action_str = f"{target_user} was promoted to `{info['role_name']}`"
-                                embed_color = LIGHT_GREEN_COLOR
+                                embed_color = YELLOW_COLOR
 
                             embed = discord.Embed(
                                 title=title,
@@ -832,12 +831,12 @@ class RobloxAuditLoggerClient2(commands.Cog):
                 title = "Demotion"
                 headline = "There has been a demotion"
                 action_str = f"{target_user} was demoted to `{new_role}`"
-                embed_color = YELLOW_COLOR
+                embed_color = PURPLE_COLOR
             elif action_type == "Promote Member" or (new_rank_num > old_rank_num):
                 title = "Promotion"
                 headline = "There has been a promotion"
                 action_str = f"{target_user} was promoted to `{new_role}`"
-                embed_color = LIGHT_GREEN_COLOR
+                embed_color = YELLOW_COLOR
                 is_promotion = True
             else:
                 title = "Rank Change"
