@@ -99,6 +99,7 @@ class RobloxAuditLoggerClient2(commands.Cog):
             headers = {
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
                 "Accept": "application/json, text/plain, */*",
+                "Accept-Encoding": "gzip, deflate",  # BANDWIDTH FIX: Enable GZIP compression
                 "Accept-Language": "en-US,en;q=0.9"
             }
             cookie_str = os.getenv("ROBLOX_COOKIE")
@@ -149,9 +150,10 @@ class RobloxAuditLoggerClient2(commands.Cog):
 
     async def _fetch_group_roles(self, group_id: int) -> List[Dict[str, Any]]:
         now = time.time()
+        # BANDWIDTH FIX: Extended cache TTL from 1 hr (3600s) to 6 hrs (21600s)
         if group_id in self.roles_cache:
             cache_entry = self.roles_cache[group_id]
-            if now - cache_entry["timestamp"] < 3600:
+            if now - cache_entry["timestamp"] < 21600:
                 return cache_entry["roles"]
 
         roles_url = f"https://groups.roblox.com/v1/groups/{group_id}/roles"
@@ -181,7 +183,8 @@ class RobloxAuditLoggerClient2(commands.Cog):
             
             cursor = ""
             pages_fetched = 0
-            max_pages = 2
+            # BANDWIDTH FIX: Limit max pages scanned per role to 1
+            max_pages = 1
 
             while pages_fetched < max_pages:
                 members_url = (
@@ -566,10 +569,11 @@ class RobloxAuditLoggerClient2(commands.Cog):
         await interaction.followup.send(embed=embed, ephemeral=not visible)
 
     # ====================================================================
-    # Background Poller Loop (~30.0s Interval)
+    # Background Poller Loop (~90.0s Interval to save bandwidth)
     # ====================================================================
 
-    @tasks.loop(seconds=30.0)
+    # BANDWIDTH FIX: Changed interval from 30.0s to 90.0s
+    @tasks.loop(seconds=90.0)
     async def poll_logs_task(self):
         await self.bot.wait_until_ready()
         try:
@@ -598,7 +602,8 @@ class RobloxAuditLoggerClient2(commands.Cog):
                 if mode == "audit_log":
                     await self.poll_audit_log_mode(db, session, cfg, channel, group_id, group_name, min_rank_val)
                 else:
-                    if self.cycle_count % 10 == 0:
+                    # BANDWIDTH FIX: Only execute public polling once every 30 cycles (~45 mins)
+                    if self.cycle_count % 30 == 0:
                         asyncio.create_task(self.poll_public_mode(db, cfg, channel, group_id, group_name, min_rank_val))
 
         except Exception:
