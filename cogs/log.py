@@ -693,10 +693,12 @@ class RobloxAuditLoggerClient2(commands.Cog):
         try:
             current_members, is_complete = await self._fetch_filtered_group_members(group_id, min_rank_val)
             
+            # If the fetch failed or came back incomplete, DO NOT compare or spam
             if not is_complete or not current_members:
                 tracker.update_interval(False)
                 return
 
+            # Initialize cache on first run without sending join spam for existing members
             if not cached_members:
                 await db["group_configs"].update_one({"_id": cfg["_id"]}, {"$set": {"member_cache": current_members}})
                 tracker.update_interval(False)
@@ -706,14 +708,22 @@ class RobloxAuditLoggerClient2(commands.Cog):
             footer_str = format_footer_timestamp(now_dt)
             group_link = f"[{group_name}](https://www.roblox.com/groups/{group_id})"
 
+            # Working copy of member cache to update incrementally
+            updated_cache = dict(cached_members)
+
+            # 1. CHECK FOR NEW JOINS & RANK CHANGES
             for uid, info in current_members.items():
                 target_user = info["username"]
                 target_link = f"[{target_user}](https://www.roblox.com/users/{uid}/profile)"
                 user_rank = info.get("rank", 0)
 
+                # NEW JOIN
                 if uid not in cached_members:
                     if user_rank >= min_rank_val:
                         has_changes = True
+                        # Mark as seen IMMEDIATELY in local working dict to stop duplicates
+                        updated_cache[uid] = info
+
                         embed = discord.Embed(
                             title="Group Join",
                             description=f"There has been a new join\n\n{target_user} joined as `{info['role_name']}`",
@@ -727,13 +737,17 @@ class RobloxAuditLoggerClient2(commands.Cog):
                             await channel.send(embed=embed)
                         except Exception:
                             pass
+
+                # RANK CHANGE (Promotion / Demotion)
                 else:
                     old_info = cached_members[uid]
                     old_rank_num = old_info.get("rank", 0)
 
-                    if old_info["role_name"] != info["role_name"]:
+                    if old_info.get("role_name") != info.get("role_name"):
                         if user_rank >= min_rank_val or old_rank_num >= min_rank_val:
                             has_changes = True
+                            updated_cache[uid] = info
+
                             is_demotion = user_rank < old_rank_num
                             
                             if is_demotion:
@@ -754,7 +768,7 @@ class RobloxAuditLoggerClient2(commands.Cog):
                             )
                             embed.add_field(name="Username", value=target_link, inline=False)
                             embed.add_field(name="Group", value=group_link, inline=False)
-                            embed.add_field(name="Old rank", value=old_info["role_name"], inline=False)
+                            embed.add_field(name="Old rank", value=old_info.get("role_name", "Unknown"), inline=False)
                             embed.add_field(name="New rank", value=info["role_name"], inline=False)
                             embed.set_footer(text=footer_str)
                             try:
@@ -764,10 +778,13 @@ class RobloxAuditLoggerClient2(commands.Cog):
                             except Exception:
                                 pass
 
-            for uid, old_info in cached_members.items():
+            # 2. CHECK FOR LEAVES / EXILES
+            for uid, old_info in list(cached_members.items()):
                 if uid not in current_members:
                     if old_info.get("rank", 0) >= min_rank_val:
                         has_changes = True
+                        updated_cache.pop(uid, None)
+
                         target_user = old_info.get("username", f"User {uid}")
                         target_link = f"[{target_user}](https://www.roblox.com/users/{uid}/profile)"
                         embed = discord.Embed(
@@ -784,12 +801,12 @@ class RobloxAuditLoggerClient2(commands.Cog):
                         except Exception:
                             pass
 
-            await db["group_configs"].update_one({"_id": cfg["_id"]}, {"$set": {"member_cache": current_members}})
+            # Save the updated working cache to MongoDB
+            await db["group_configs"].update_one({"_id": cfg["_id"]}, {"$set": {"member_cache": updated_cache}})
 
         except Exception:
             pass
         finally:
-            # Update dynamic tracker based on whether changes were detected
             tracker.update_interval(has_changes)
 
     async def send_formatted_log(self, channel, entry, group_id, group_name, min_rank_val: int = 0):
