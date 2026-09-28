@@ -79,7 +79,7 @@ def format_footer_timestamp(dt: Optional[datetime] = None) -> str:
 
 
 # ==========================================
-# DYNAMIC POLLING TRACKER
+# DYNAMIC POLLING TRACKER (OPTIMIZED)
 # ==========================================
 class GroupTracker:
     """Tracks polling intervals individually for each group to optimize bandwidth."""
@@ -87,27 +87,27 @@ class GroupTracker:
         self.group_id = group_id
         self.last_polled: float = 0.0
         self.last_changed: float = time.time()
-        self.current_interval: int = 60  # Default 60s loop
+        self.current_interval: int = 300  # Default 5-minute loop (300s)
 
     def update_interval(self, has_changes: bool):
         now = time.time()
         self.last_polled = now
 
         if has_changes:
-            # Reset to fast 60s polling immediately when a change occurs
+            # Reset to 5-minute active polling immediately when a change occurs
             self.last_changed = now
-            self.current_interval = 60
+            self.current_interval = 300
             return
 
         quiet_duration = now - self.last_changed
 
-        # Scale down polling rate for quiet groups
-        if quiet_duration > 21600:    # Quiet > 6 hours -> Poll every 10 mins
-            self.current_interval = 600
-        elif quiet_duration > 7200:   # Quiet > 2 hours -> Poll every 3 mins
-            self.current_interval = 180
-        else:                         # Default active -> Poll every 60s
-            self.current_interval = 60
+        # Dynamic scaling based on activity level
+        if quiet_duration > 3600:     # Quiet > 1 hour -> Poll every 9 mins (540s)
+            self.current_interval = 540
+        elif quiet_duration > 1800:   # Quiet > 30 mins -> Poll every 7 mins (420s)
+            self.current_interval = 420
+        else:                         # Active -> Poll every 5 mins (300s)
+            self.current_interval = 300
 
     def is_due(self) -> bool:
         return (time.time() - self.last_polled) >= self.current_interval
