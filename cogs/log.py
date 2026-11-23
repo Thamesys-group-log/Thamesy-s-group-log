@@ -1,6 +1,7 @@
 import os
 import re
 import json
+import calendar
 import time
 import random
 import hashlib
@@ -8,7 +9,6 @@ import logging
 import asyncio
 import aiohttp
 import discord
-from urllib.parse import quote, urlparse
 from discord import app_commands
 from discord.ext import commands, tasks
 from datetime import datetime, timezone
@@ -19,30 +19,45 @@ try:
 except ImportError:
     motor = None
 
-# ==========================================
-# CONFIGURATION
-# ==========================================
-WORKER_URL = os.getenv(
-    "WORKER_URL", "https://roblox-audit-proxy.madefordiscordbot.workers.dev"
-).rstrip("/")
+AUTHORIZED_USER_IDS = [947558109503692802, 1219266886143967245, 1391931433521774742]
 
-AUTHORIZED_USER_IDS = {947558109503692802, 1219266886143967245, 1391931433521774742}
-
-# Color Definitions for Client 2
+# Client 2 embed palette
 GREEN_COLOR = discord.Color.from_rgb(46, 204, 113)   # Group Join
 YELLOW_COLOR = discord.Color.from_rgb(241, 196, 15)  # Promotion
 PURPLE_COLOR = discord.Color.from_rgb(138, 43, 226)  # Demotion / General Activity
-RED_COLOR = discord.Color.from_rgb(231, 76, 60)      # Exile / Kick / Leave
+RED_COLOR = discord.Color.from_rgb(231, 76, 60)      # Exile / Leave
 
-DB_NAME = "roblox_audit_logger_client2"
 BRAND = "TGE Logs"
+DB_NAME = "roblox_audit_logger_client2"
 
-AUDIT_POLL_INTERVAL = 30     # Seconds between audit-log polls per group
-ROLES_CACHE_TTL = 21600      # 6 hours
-MAX_PAGES_PER_ROLE = 2       # 2 pages x 100 = 200 members per role (bandwidth cap)
-MAX_EVENTS_PER_POLL = 30     # More changes than this at once = stale baseline, resync quietly
+AUDIT_POLL_INTERVAL = 30      # Seconds between audit-log polls per group
+ROLES_CACHE_TTL = 3600        # Seconds to cache a group's role list
+MAX_PAGES_PER_ROLE = 2        # 2 pages x 100 = 200 members per role (bandwidth cap)
 
-log = logging.getLogger("roblox_audit_client2")
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, default))
+    except (TypeError, ValueError):
+        return default
+
+
+# --- Bandwidth protection ------------------------------------------------
+# Render's free plan includes 5 GB of outbound data per month for the whole workspace.
+# The bot counts what it sends and slows down (or pauses) before that budget runs out.
+# Set BANDWIDTH_BUDGET_MB lower if several bots share one Render workspace.
+BANDWIDTH_BUDGET_BYTES = int(_env_float("BANDWIDTH_BUDGET_MB", 3000) * 1024 * 1024)
+BANDWIDTH_PAUSE_AT = 0.98      # Stop polling at 98% of the budget until the next month
+MAX_SLOWDOWN = 12.0            # Never stretch poll intervals more than 12x
+REQUEST_OVERHEAD_BYTES = 1200  # Estimated size of one outgoing HTTP request (headers)
+EMBED_SEND_BYTES = 3000        # Estimated size of one Discord embed message
+CONFIG_REFRESH_SECONDS = 60    # How often saved setups are re-read from MongoDB
+USAGE_FLUSH_SECONDS = 600      # How often the usage counter is saved to MongoDB
+
+# The saved setups are scanned without any old saved member list (rosters live in memory only)
+CONFIG_PROJECTION = {"member_cache": 0}
+
+log = logging.getLogger("roblox_audit")
 
 _mongo_client = None
 
@@ -74,26 +89,41 @@ def is_authorized_user(user_id: int) -> bool:
 
 
 def extract_group_id(input_val: str) -> Optional[int]:
-    """Extracts a group ID from a number, a Roblox group/community link, or short text like 'Group 123'."""
-    if not input_val:
-        return None
-    text = str(input_val).strip()
-    if text.isdigit():
-        return int(text) or None
+    """Extracts a group ID from a plain integer string or a Roblox group URL."""
+    clean_input = input_val.strip()
+    if clean_input.isdigit():
+        return int(clean_input)
 
-    match = re.search(r"(?:groups|communities)/(\d+)", text, re.IGNORECASE)
+    match = re.search(r"roblox\.com/(?:[a-z]{2}/)?groups/(\d+)", clean_input, re.IGNORECASE)
     if match:
-        return int(match.group(1)) or None
-
-    # Last resort: accept text that contains exactly one number
-    runs = re.findall(r"\d+", text)
-    if len(runs) == 1:
-        return int(runs[0]) or None
+        return int(match.group(1))
     return None
 
 
+def audit_entry_key(entry: Dict[str, Any]) -> str:
+    """Stable identifier for an audit-log entry.
+
+    Roblox audit-log entries do not reliably include an "id", so fall back to
+    a hash of the whole entry. This keeps the "what is new?" watermark working.
+    """
+    if entry.get("id") is not None:
+        return str(entry["id"])
+    raw = json.dumps(entry, sort_keys=True, default=str)
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()
+
+
+def user_link(name: str, user_id: Any = None) -> str:
+    if user_id:
+        return f"[{name}](https://www.roblox.com/users/{user_id}/profile)"
+    return f"**{name}**"
+
+
+def error_embed(title: str, description: Optional[str] = None) -> discord.Embed:
+    return discord.Embed(title=title, description=description, color=RED_COLOR)
+
+
 def format_footer_timestamp(dt: Optional[datetime] = None) -> str:
-    """Formats timestamp to match: TGE Logs | YYYY/MM/DD, HH:MM AM/PM"""
+    """Formats the footer as: TGE Logs | YYYY/MM/DD, HH:MM AM/PM (UTC)"""
     if dt is None:
         dt = datetime.now(timezone.utc)
     elif dt.tzinfo is not None:
@@ -101,82 +131,66 @@ def format_footer_timestamp(dt: Optional[datetime] = None) -> str:
     return f"{BRAND} | {dt.strftime('%Y/%m/%d, %I:%M %p')}"
 
 
-def audit_entry_key(entry: Dict[str, Any]) -> str:
-    """Stable identifier for an audit-log entry (its id, or a hash if there is none)."""
-    if entry.get("id") is not None:
-        return str(entry["id"])
-    raw = json.dumps(entry, sort_keys=True, default=str)
-    return hashlib.sha1(raw.encode("utf-8")).hexdigest()
+# ==========================================
+# BANDWIDTH GUARD
+# ==========================================
+class BandwidthGuard:
+    """Counts the data this bot sends out and slows polling down before a monthly cap is reached.
 
-
-def safe_name(value: Any) -> str:
-    """Escapes Discord markdown so names like a_b_c do not turn into italics."""
-    if value is None:
-        return "Unknown"
-    return discord.utils.escape_markdown(str(value))
-
-
-def user_link(name: Any, user_id: Any = None) -> str:
-    if user_id:
-        return f"[{safe_name(name)}](https://www.roblox.com/users/{user_id}/profile)"
-    return f"**{safe_name(name)}**"
-
-
-def error_embed(title: str, description: Optional[str] = None) -> discord.Embed:
-    return discord.Embed(title=title, description=description, color=RED_COLOR)
-
-
-def _rank(info: Dict[str, Any]) -> int:
-    return info.get("rank") or 0
-
-
-def diff_members(
-    cached: Dict[str, Dict[str, Any]],
-    current: Dict[str, Dict[str, Any]],
-    truncated: Set[str],
-    min_rank_val: int,
-) -> Tuple[List[Tuple[str, str, Optional[Dict[str, Any]], Optional[Dict[str, Any]]]], Dict[str, Dict[str, Any]]]:
-    """Compares two member snapshots.
-
-    Returns (events, updated_cache). Each event is (kind, uid, new_info, old_info)
-    where kind is join / promotion / demotion / leave.
-
-    Members of roles in `truncated` (too big to read fully) are skipped for
-    joins and leaves, because they may just have moved in or out of view.
+    It keeps a running total for the month, compares it with how much of the month has
+    passed, and returns a slow-down factor (or None when the budget is used up and
+    polling should pause until next month).
     """
-    events: List[Tuple[str, str, Optional[Dict[str, Any]], Optional[Dict[str, Any]]]] = []
-    updated = dict(cached)
 
-    for uid, info in current.items():
-        old = cached.get(uid)
+    def __init__(self, budget_bytes: int):
+        self.budget = max(int(budget_bytes), 0)
+        self.month = self._month_key()
+        self.used = 0
+        self.dirty = False
 
-        if old is None:
-            if info.get("role_name") in truncated or _rank(info) < min_rank_val:
-                continue
-            updated[uid] = info
-            events.append(("join", uid, info, None))
-            continue
+    @staticmethod
+    def _month_key() -> str:
+        return datetime.now(timezone.utc).strftime("%Y-%m")
 
-        if old.get("role_name") == info.get("role_name"):
-            continue
+    def _roll(self):
+        key = self._month_key()
+        if key != self.month:
+            self.month, self.used, self.dirty = key, 0, True
 
-        updated[uid] = info
-        if max(_rank(old), _rank(info)) < min_rank_val:
-            continue
-        kind = "demotion" if _rank(info) < _rank(old) else "promotion"
-        events.append((kind, uid, info, old))
+    def add(self, nbytes: int):
+        self._roll()
+        self.used += int(nbytes)
+        self.dirty = True
 
-    for uid, old in cached.items():
-        if uid in current:
-            continue
-        if old.get("role_name") in truncated:
-            continue
-        updated.pop(uid, None)
-        if _rank(old) < min_rank_val:
-            continue
-        events.append(("leave", uid, None, old))
+    def restore(self, month: Any, used: Any):
+        """Adds the total saved before a restart (only if it is for the current month)."""
+        self._roll()
+        if month == self.month and isinstance(used, (int, float)):
+            self.used += int(used)
+            self.dirty = True
 
-    return events, updated
+    @staticmethod
+    def month_progress() -> float:
+        now = datetime.now(timezone.utc)
+        days = calendar.monthrange(now.year, now.month)[1]
+        elapsed = (now.day - 1) * 86400 + now.hour * 3600 + now.minute * 60 + now.second
+        return elapsed / (days * 86400)
+
+    def multiplier(self) -> Optional[float]:
+        """1.0 = full speed, >1 = poll less often, None = budget used up (pause)."""
+        self._roll()
+        if self.budget <= 0:
+            return 1.0
+        fraction = self.used / self.budget
+        if fraction >= BANDWIDTH_PAUSE_AT:
+            return None
+        pace = fraction / max(self.month_progress(), 0.05)  # >1 means spending faster than the month allows
+        return 1.0 if pace <= 1.0 else min(pace, MAX_SLOWDOWN)
+
+    def summary(self) -> str:
+        self._roll()
+        mb = 1024 * 1024
+        return f"{self.used / mb:.0f} / {self.budget / mb:.0f} MB this month"
 
 
 # ==========================================
@@ -209,37 +223,45 @@ class GroupTracker:
         else:                          # Active -> every 5 minutes
             self.current_interval = 300
 
-    def is_due(self) -> bool:
-        return (time.time() - self.last_polled) >= self.current_interval
+    def is_due(self, multiplier: float = 1.0) -> bool:
+        return (time.time() - self.last_polled) >= self.current_interval * multiplier
 
 
 # ==========================================
 # MAIN COG
 # ==========================================
-class RobloxAuditLoggerClient2(commands.Cog):
+class RobloxAuditLogger(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
         self.session: Optional[aiohttp.ClientSession] = None
         self.cycle_count: int = 0
         self.start_time: datetime = datetime.now(timezone.utc)
-        self.roles_cache: Dict[int, Dict[str, Any]] = {}
-        self.group_trackers: Dict[Any, GroupTracker] = {}   # keyed by config _id
-        self.public_tasks: Dict[Any, asyncio.Task] = {}     # one running public poll per config
-        self.last_cycle_at: float = time.time()
-        self.proxy_last_ok: float = 0.0
-        self.proxy_last_fail: float = 0.0
-
-        cookie = (os.getenv("ROBLOX_COOKIE") or "").strip()
-        if ".ROBLOSECURITY=" in cookie:
-            cookie = cookie.split(".ROBLOSECURITY=")[-1]
-        self._roblox_cookie: Optional[str] = cookie or None
-
+        self.roles_cache: Dict[int, Dict[str, Any]] = {}      # {group_id: {"timestamp", "roles"}}
+        self.group_trackers: Dict[Any, GroupTracker] = {}     # keyed by config _id
+        self.initialized_groups: Set[Tuple[str, int]] = set() # (guild_id, group_id) synced this run
+        self.public_tasks: Dict[Any, asyncio.Task] = {}       # One running public poll per config
+        self.last_cycle_at: float = time.time()               # Heartbeat for the watchdog
+        self.guard = BandwidthGuard(BANDWIDTH_BUDGET_BYTES)
+        self._cookie_len: int = len((os.getenv("ROBLOX_COOKIE") or "").strip())
+        self.configs: List[Dict[str, Any]] = []               # saved setups, refreshed every minute
+        self.configs_loaded_at: float = 0.0
+        self.configs_dirty: bool = True
+        self.member_caches: Dict[Any, Dict[str, Any]] = {}    # roster per config, memory only
+        self.usage_loaded: bool = False
+        self.usage_flushed_at: float = 0.0
+        self.cleaned_old_rosters: bool = False
+        self.guard_state: str = "normal"
         self.poll_logs_task.start()
+        self.watchdog_task.start()
 
     async def cog_unload(self):
         self.poll_logs_task.cancel()
+        self.watchdog_task.cancel()
         for task in list(self.public_tasks.values()):
             task.cancel()
+        db = get_db()
+        if db is not None:
+            await self._flush_usage(db, force=True)
         if self.session and not self.session.closed:
             await self.session.close()
 
@@ -247,14 +269,7 @@ class RobloxAuditLoggerClient2(commands.Cog):
     # Small helpers
     # ------------------------------------------------------------------
     @staticmethod
-    async def _deny(interaction: discord.Interaction):
-        await interaction.response.send_message(
-            embed=error_embed("Permission Denied", "You are not authorized to use this command."),
-            ephemeral=True,
-        )
-
-    @staticmethod
-    def _embed(
+    def _make_embed(
         title: str,
         description: str,
         color: discord.Color,
@@ -267,7 +282,8 @@ class RobloxAuditLoggerClient2(commands.Cog):
         embed.set_footer(text=format_footer_timestamp(footer_dt))
         return embed
 
-    async def _post(self, channel, embed: discord.Embed, react: Optional[str] = None):
+    async def _send(self, channel, embed: discord.Embed, react: Optional[str] = None):
+        self.guard.add(EMBED_SEND_BYTES)
         try:
             msg = await channel.send(embed=embed)
         except discord.Forbidden:
@@ -282,6 +298,73 @@ class RobloxAuditLoggerClient2(commands.Cog):
             except discord.HTTPException:
                 log.debug("Could not add reaction in channel %s", getattr(channel, "id", "?"))
 
+    def _event_embed(
+        self,
+        kind: str,
+        user: str,
+        link: str,
+        group_link: str,
+        footer_dt: Optional[datetime] = None,
+        new_role: Optional[str] = None,
+        old_role: Optional[str] = None,
+    ) -> discord.Embed:
+        """The Client 2 look for every log embed."""
+        if kind == "join":
+            return self._make_embed(
+                "Group Join",
+                f"There has been a new join\n\n{user} joined as `{new_role}`",
+                GREEN_COLOR,
+                [("Username", link), ("Group", group_link), ("New rank", str(new_role))],
+                footer_dt,
+            )
+        if kind == "promotion":
+            return self._make_embed(
+                "Promotion",
+                f"There has been a promotion\n\n{user} was promoted to `{new_role}`",
+                YELLOW_COLOR,
+                [("Username", link), ("Group", group_link), ("Old rank", str(old_role)), ("New rank", str(new_role))],
+                footer_dt,
+            )
+        if kind == "demotion":
+            return self._make_embed(
+                "Demotion",
+                f"There has been a demotion\n\n{user} was demoted to `{new_role}`",
+                PURPLE_COLOR,
+                [("Username", link), ("Group", group_link), ("Old rank", str(old_role)), ("New rank", str(new_role))],
+                footer_dt,
+            )
+        if kind == "rank_change":
+            return self._make_embed(
+                "Rank Change",
+                f"There has been a rank change\n\n{user}'s rank was changed to `{new_role}`",
+                PURPLE_COLOR,
+                [("Username", link), ("Group", group_link), ("Old rank", str(old_role)), ("New rank", str(new_role))],
+                footer_dt,
+            )
+        if kind == "leave":
+            return self._make_embed(
+                "Exile",
+                f"There has been an exile or leave\n\n{user} left the group",
+                RED_COLOR,
+                [("Username", link), ("Group", group_link), ("Old rank", str(old_role))],
+                footer_dt,
+            )
+        # exile
+        return self._make_embed(
+            "Exile",
+            f"There has been an exile\n\n{user} was exiled",
+            RED_COLOR,
+            [("Username", link), ("Group", group_link)],
+            footer_dt,
+        )
+
+    @staticmethod
+    async def _deny(interaction: discord.Interaction):
+        await interaction.response.send_message(
+            embed=error_embed("Permission Denied", "You are not authorized to use this command."),
+            ephemeral=True,
+        )
+
     @staticmethod
     def _rank_for(roles: List[Dict[str, Any]], role_id: Any = None, role_name: Optional[str] = None) -> Optional[int]:
         """Looks up a rank number by role ID first, then by role name."""
@@ -295,72 +378,80 @@ class RobloxAuditLoggerClient2(commands.Cog):
                     return r.get("rank", 0)
         return None
 
-    def _proxy_status(self) -> str:
-        if not self.proxy_last_ok and not self.proxy_last_fail:
-            return "No requests yet"
-        if self.proxy_last_ok >= self.proxy_last_fail:
-            return f"Online (last OK {int(time.time() - self.proxy_last_ok)}s ago)"
-        return "Failing"
+    # ------------------------------------------------------------------
+    # Bandwidth and database helpers
+    # ------------------------------------------------------------------
+    def _count_request(self):
+        self.guard.add(REQUEST_OVERHEAD_BYTES + self._cookie_len)
 
-    def _event_embed(
-        self,
-        kind: str,
-        user: str,
-        link: str,
-        group_link: str,
-        footer_dt: Optional[datetime] = None,
-        new_role: Optional[str] = None,
-        old_role: Optional[str] = None,
-    ) -> discord.Embed:
-        user = safe_name(user)
-        if kind == "join":
-            return self._embed(
-                "Group Join",
-                f"There has been a new join\n\n{user} joined as `{new_role}`",
-                GREEN_COLOR,
-                [("Username", link), ("Group", group_link), ("New rank", str(new_role))],
-                footer_dt,
+    async def _get_configs(self, db) -> List[Dict[str, Any]]:
+        """Saved setups, re-read from MongoDB at most once a minute (or after a change)."""
+        now = time.time()
+        if self.configs_dirty or now - self.configs_loaded_at >= CONFIG_REFRESH_SECONDS:
+            self.configs = await db["group_configs"].find({}, CONFIG_PROJECTION).to_list(length=1000)
+            self.guard.add(600)
+            self.configs_loaded_at = now
+            self.configs_dirty = False
+        return self.configs
+
+    async def _update_config(self, db, cfg: Dict[str, Any], fields: Optional[Dict[str, Any]] = None,
+                             unset: Optional[List[str]] = None):
+        """Small database update that also keeps the in-memory copy in step."""
+        update: Dict[str, Any] = {}
+        if fields:
+            update["$set"] = fields
+        if unset:
+            update["$unset"] = {name: "" for name in unset}
+        if not update:
+            return
+        await db["group_configs"].update_one({"_id": cfg["_id"]}, update)
+        self.guard.add(600)
+        if fields:
+            cfg.update(fields)
+        for name in unset or []:
+            cfg.pop(name, None)
+
+    async def _flush_usage(self, db, force: bool = False):
+        if not self.guard.dirty:
+            return
+        now = time.time()
+        if not force and now - self.usage_flushed_at < USAGE_FLUSH_SECONDS:
+            return
+        try:
+            await db["usage"].update_one(
+                {"_id": "bandwidth"},
+                {"$set": {"month": self.guard.month, "used": self.guard.used}},
+                upsert=True,
             )
-        if kind == "promotion":
-            return self._embed(
-                "Promotion",
-                f"There has been a promotion\n\n{user} was promoted to `{new_role}`",
-                YELLOW_COLOR,
-                [("Username", link), ("Group", group_link), ("Old rank", str(old_role)), ("New rank", str(new_role))],
-                footer_dt,
-            )
-        if kind == "demotion":
-            return self._embed(
-                "Demotion",
-                f"There has been a demotion\n\n{user} was demoted to `{new_role}`",
-                PURPLE_COLOR,
-                [("Username", link), ("Group", group_link), ("Old rank", str(old_role)), ("New rank", str(new_role))],
-                footer_dt,
-            )
-        if kind == "rank_change":
-            return self._embed(
-                "Rank Change",
-                f"There has been a rank change\n\n{user}'s rank was changed to `{new_role}`",
-                PURPLE_COLOR,
-                [("Username", link), ("Group", group_link), ("Old rank", str(old_role)), ("New rank", str(new_role))],
-                footer_dt,
-            )
-        if kind == "leave":
-            return self._embed(
-                "Exile",
-                f"There has been an exile or leave\n\n{user} left the group",
-                RED_COLOR,
-                [("Username", link), ("Group", group_link), ("Old rank", str(old_role))],
-                footer_dt,
-            )
-        # exile
-        return self._embed(
-            "Exile",
-            f"There has been an exile\n\n{user} was exiled",
-            RED_COLOR,
-            [("Username", link), ("Group", group_link)],
-            footer_dt,
-        )
+            self.guard.dirty = False
+            self.usage_flushed_at = now
+        except Exception:
+            log.warning("Could not save the bandwidth counter", exc_info=True)
+
+    async def _sync_usage(self, db):
+        """Loads the saved monthly total once after a restart, then saves it every few minutes."""
+        if not self.usage_loaded:
+            self.usage_loaded = True
+            try:
+                doc = await db["usage"].find_one({"_id": "bandwidth"})
+                if doc:
+                    self.guard.restore(doc.get("month"), doc.get("used"))
+            except Exception:
+                log.warning("Could not load the bandwidth counter", exc_info=True)
+        if not self.cleaned_old_rosters:
+            self.cleaned_old_rosters = True
+            try:
+                # Rosters used to be saved in MongoDB on every poll. They live in memory now.
+                await db["group_configs"].update_many({"member_cache": {"$exists": True}}, {"$unset": {"member_cache": ""}})
+            except Exception:
+                log.warning("Could not clean up old saved rosters", exc_info=True)
+        await self._flush_usage(db)
+
+    def _note_guard_state(self, multiplier: Optional[float]):
+        state = "paused" if multiplier is None else ("slowed" if multiplier > 1.0 else "normal")
+        if state != self.guard_state:
+            log.warning("Bandwidth guard is now %s (%s)", state, self.guard.summary())
+            self.guard_state = state
 
     # ------------------------------------------------------------------
     # Fun listener (1 in 10 chance when pinged)
@@ -382,35 +473,30 @@ class RobloxAuditLoggerClient2(commands.Cog):
     async def get_http_session(self) -> aiohttp.ClientSession:
         if self.session is None or self.session.closed:
             headers = {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                "Accept": "application/json, text/plain, */*",
-                "Accept-Encoding": "gzip, deflate",
-                "Accept-Language": "en-US,en;q=0.9",
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
             }
-            # No cookies on the session itself: a session-wide cookie would be
-            # sent to every host, including the Cloudflare Worker.
-            self.session = aiohttp.ClientSession(headers=headers, timeout=aiohttp.ClientTimeout(total=10))
+            cookie_str = os.getenv("ROBLOX_COOKIE")
+            cookies = {}
+            if cookie_str:
+                clean_cookie = cookie_str.strip()
+                if ".ROBLOSECURITY=" in clean_cookie:
+                    clean_cookie = clean_cookie.split(".ROBLOSECURITY=")[-1]
+                cookies = {".ROBLOSECURITY": clean_cookie}
+
+            timeout = aiohttp.ClientTimeout(total=10)
+            self.session = aiohttp.ClientSession(headers=headers, cookies=cookies, timeout=timeout)
         return self.session
 
-    def _headers_for(self, url: str) -> Dict[str, str]:
-        """Attaches the Roblox cookie only to requests that go to roblox.com."""
-        if not self._roblox_cookie:
-            return {}
-        host = (urlparse(url).hostname or "").lower()
-        if host == "roblox.com" or host.endswith(".roblox.com"):
-            return {"Cookie": f".ROBLOSECURITY={self._roblox_cookie}"}
-        return {}
-
     async def _safe_fetch_json(self, url: str, max_retries: int = 3) -> Optional[Dict[str, Any]]:
-        """Fetches JSON with backoff for rate limits and transient server errors."""
+        """Fetches JSON with backoff for Roblox rate limits and transient server errors."""
         session = await self.get_http_session()
-        headers = self._headers_for(url)
         for attempt in range(max_retries):
             is_last = attempt == max_retries - 1
+            self._count_request()
             try:
-                async with session.get(url, headers=headers) as resp:
+                async with session.get(url) as resp:
                     if resp.status == 200:
-                        return await resp.json(content_type=None)
+                        return await resp.json()
 
                     if resp.status == 429:
                         retry_after = resp.headers.get("Retry-After", "")
@@ -434,50 +520,29 @@ class RobloxAuditLoggerClient2(commands.Cog):
                 await asyncio.sleep(0.5 * (2 ** attempt))
         return None
 
-    async def _fetch_proxy_json(self, url: str, max_retries: int = 3) -> Optional[Dict[str, Any]]:
-        """Fetch through the Cloudflare Worker and remember whether it is working."""
-        data = await self._safe_fetch_json(url, max_retries=max_retries)
-        if data is None:
-            self.proxy_last_fail = time.time()
-        else:
-            self.proxy_last_ok = time.time()
-        return data
-
-    async def _fetch_group_details(self, group_id: int) -> Optional[Dict[str, Any]]:
-        data = await self._safe_fetch_json(f"https://groups.roblox.com/v1/groups/{group_id}", max_retries=2)
-        if data and "name" in data:
-            return data
-
-        fallback = await self._safe_fetch_json(f"https://groups.roblox.com/v2/groups?groupIds={group_id}", max_retries=2)
-        if fallback and fallback.get("data"):
-            return fallback["data"][0]
-        return None
-
-    # --------------------------------------------------------------------
-    # PROXIED FETCHERS (Cloudflare Worker)
-    # --------------------------------------------------------------------
     async def _fetch_group_roles(self, group_id: int) -> List[Dict[str, Any]]:
+        """Fetches a group's roles with a 1-hour cache."""
         now = time.time()
         entry = self.roles_cache.get(group_id)
         if entry and now - entry["timestamp"] < ROLES_CACHE_TTL:
             return entry["roles"]
 
-        data = await self._fetch_proxy_json(f"{WORKER_URL}/roles?groupId={group_id}", max_retries=3)
+        data = await self._safe_fetch_json(f"https://groups.roblox.com/v1/groups/{group_id}/roles", max_retries=3)
         if data and "roles" in data:
             roles = data["roles"]
             self.roles_cache[group_id] = {"timestamp": now, "roles": roles}
             return roles
-        # Fall back to a stale cache rather than nothing
+        # Fall back to stale cache rather than nothing
         return entry["roles"] if entry else []
 
     async def _fetch_filtered_group_members(
         self, group_id: int, min_rank_val: int = 0
     ) -> Tuple[Dict[str, Dict[str, Any]], bool, Set[str]]:
-        """Returns (member_map, all_succeeded, truncated_role_names).
+        """Returns (member_map, all_pages_succeeded, truncated_role_names).
 
-        A role is "truncated" when it has more members than we could read
-        (or the Worker did not let us page through them). Join and leave events
-        for those roles are skipped because they would be unreliable.
+        A role is "truncated" when it has more members than MAX_PAGES_PER_ROLE
+        pages can show. Join/leave events for those roles are unreliable because
+        members can slip in and out of the visible window, so callers skip them.
         """
         roles = await self._fetch_group_roles(group_id)
         if not roles:
@@ -485,69 +550,54 @@ class RobloxAuditLoggerClient2(commands.Cog):
 
         # Rank 0 is the Guest role, which is not a real membership list
         target_roles = [r for r in roles if r.get("rank", 0) >= max(min_rank_val, 1)]
-        if not target_roles:
-            return {}, False, set()
 
         member_map: Dict[str, Dict[str, Any]] = {}
         truncated: Set[str] = set()
-        all_succeeded = True
+        all_pages_succeeded = True
 
         for role in target_roles:
             role_id = role.get("id")
             role_name = role.get("name")
             role_rank = role.get("rank")
 
-            seen_in_role: Set[str] = set()
-            cursor: Optional[str] = None
-            pages = 0
-            role_truncated = False
+            cursor = ""
+            pages_fetched = 0
 
-            while True:
-                url = f"{WORKER_URL}/members?groupId={group_id}&roleId={role_id}"
+            while pages_fetched < MAX_PAGES_PER_ROLE:
+                members_url = (
+                    f"https://groups.roblox.com/v1/groups/{group_id}/roles/{role_id}/users"
+                    f"?limit=100&sortOrder=Desc"
+                )
                 if cursor:
-                    url += f"&cursor={quote(cursor, safe='')}"
+                    members_url += f"&cursor={cursor}"
 
-                m_data = await self._fetch_proxy_json(url, max_retries=2)
+                m_data = await self._safe_fetch_json(members_url, max_retries=2)
                 if m_data is None:
-                    all_succeeded = False
+                    all_pages_succeeded = False
                     break
 
-                batch = m_data.get("data") or []
-                new_ids = 0
-                for u in batch:
+                for u in m_data.get("data", []):
                     uid = str(u.get("userId"))
-                    if uid not in seen_in_role:
-                        seen_in_role.add(uid)
-                        new_ids += 1
                     member_map[uid] = {
                         "username": u.get("username"),
                         "role_name": role_name,
                         "rank": role_rank,
                     }
 
-                pages += 1
-                next_cursor = m_data.get("nextPageCursor")
-
-                if not next_cursor:
-                    # A full page with no cursor key at all means the Worker may be hiding the rest
-                    if "nextPageCursor" not in m_data and len(batch) >= 100:
-                        role_truncated = True
+                cursor = m_data.get("nextPageCursor")
+                pages_fetched += 1
+                if not cursor:
                     break
 
-                # Stop if we hit the cap, or the Worker ignored the cursor and repeated itself
-                if pages >= MAX_PAGES_PER_ROLE or new_ids == 0 or next_cursor == cursor:
-                    role_truncated = True
-                    break
-
-                cursor = next_cursor
                 await asyncio.sleep(0.2)
 
-            if not all_succeeded:
-                break
-            if role_truncated:
+            if cursor and pages_fetched >= MAX_PAGES_PER_ROLE:
                 truncated.add(role_name)
 
-        return member_map, all_succeeded, truncated
+            if not all_pages_succeeded:
+                break
+
+        return member_map, all_pages_succeeded, truncated
 
     # ------------------------------------------------------------------
     # Setup
@@ -573,33 +623,30 @@ class RobloxAuditLoggerClient2(commands.Cog):
         if not group_id:
             return await reply(error_embed(
                 "Invalid Group Input",
-                "Please provide a valid numeric Group ID or Roblox Group link.",
+                "Please provide a valid numeric Group ID or a valid Roblox Group link.",
             ))
 
         db = get_db()
         if db is None:
             return await reply(error_embed("Database Error", "Could not connect to MongoDB Atlas."))
 
-        me = interaction.guild.me
-        if me is not None:
-            perms = channel.permissions_for(me)
-            if not (perms.view_channel and perms.send_messages and perms.embed_links):
-                return await reply(error_embed(
-                    "Missing Channel Permissions",
-                    f"I need **View Channel**, **Send Messages** and **Embed Links** in {channel.mention}.",
-                ))
+        perms = channel.permissions_for(interaction.guild.me)
+        if not (perms.view_channel and perms.send_messages and perms.embed_links):
+            return await reply(error_embed(
+                "Missing Channel Permissions",
+                f"I need **View Channel**, **Send Messages** and **Embed Links** in {channel.mention}.",
+            ))
 
         try:
-            group_data = await self._fetch_group_details(group_id)
-            roles = await self._fetch_group_roles(group_id)
-
-            if not group_data and not roles:
+            group_data = await self._safe_fetch_json(f"https://groups.roblox.com/v1/groups/{group_id}", max_retries=3)
+            if not group_data:
                 return await reply(error_embed(
                     "Invalid Roblox Group",
                     f"Group ID `{group_id}` could not be retrieved from Roblox.",
                 ))
 
-            group_name = group_data.get("name") if group_data else f"Group {group_id}"
+            group_name = group_data.get("name", f"Group {group_id}")
+            roles = await self._fetch_group_roles(group_id)
 
             min_rank_value = 0
             selected_role_name = None
@@ -608,10 +655,7 @@ class RobloxAuditLoggerClient2(commands.Cog):
                 wanted = min_rank_name.strip().lower()
                 matched_role = next((r for r in roles if r.get("name", "").strip().lower() == wanted), None)
                 if not matched_role:
-                    role_list_str = (
-                        "\n".join(f"- `{r.get('name')}` (Rank {r.get('rank')})" for r in roles)
-                        if roles else "*(Unable to fetch role list)*"
-                    )
+                    role_list_str = "\n".join(f"- `{r.get('name')}` (Rank {r.get('rank')})" for r in roles)
                     return await reply(error_embed(
                         "Rank Name Not Found",
                         f"Could not find a rank matching **`{min_rank_name}`** in **{group_name}**.\n\n"
@@ -627,10 +671,11 @@ class RobloxAuditLoggerClient2(commands.Cog):
             last_audit_key: Optional[str] = None
             mode = "audit_log"
 
+            self._count_request()
             try:
-                async with session.get(audit_url, headers=self._headers_for(audit_url)) as resp:
+                async with session.get(audit_url) as resp:
                     if resp.status == 200:
-                        body = await resp.json(content_type=None)
+                        body = await resp.json()
                         logs = body.get("data", [])
                         # Empty string = "log is empty, anything that appears later is new"
                         last_audit_key = audit_entry_key(logs[0]) if logs else ""
@@ -652,29 +697,33 @@ class RobloxAuditLoggerClient2(commands.Cog):
                 "min_rank_value": min_rank_value,
                 "created_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
             }
-            update_doc: Dict[str, Any] = {"$set": config_payload}
+
+            update_doc: Dict[str, Any] = {"$set": config_payload, "$unset": {"member_cache": ""}}
 
             if mode == "public_polling":
-                initial_cache, success, _ = await self._fetch_filtered_group_members(group_id, min_rank_value)
-                config_payload["member_cache"] = initial_cache if success else {}
-                update_doc["$unset"] = {"last_audit_id": ""}
+                update_doc["$unset"]["last_audit_id"] = ""
             else:
                 config_payload["last_audit_id"] = last_audit_key
-                update_doc["$unset"] = {"member_cache": ""}
 
             await db["group_configs"].update_one(
                 {"guild_id": guild_id, "group_id": group_id},
                 update_doc,
                 upsert=True,
             )
+            self.guard.add(1500)
 
-            mode_msg = "Audit Log Stream (Cookie)" if mode == "audit_log" else "Public Polling Stream (Cloudflare Proxy)"
+            # Reload the setups on the next tick. In public mode the member list is built
+            # silently in memory on the first poll, so nothing extra is downloaded here.
+            self.configs_dirty = True
+            self.initialized_groups.add((guild_id, group_id))
+
+            mode_msg = "Audit Log Stream (Cookie)" if mode == "audit_log" else "Public Polling Stream (Fallback)"
             rank_filter_info = (
                 f"**Minimum Rank**: `{selected_role_name}` (Rank {min_rank_value}+)\n"
                 if selected_role_name else "**Minimum Rank**: `All Ranks (0+)`\n"
             )
 
-            await reply(self._embed(
+            await reply(self._make_embed(
                 "TGE Logs Configured",
                 (
                     f"**Group**: [{group_name}](https://www.roblox.com/groups/{group_id})\n"
@@ -742,7 +791,8 @@ class RobloxAuditLoggerClient2(commands.Cog):
             value=(
                 f"Database: `{db_status}`\n"
                 f"Uptime: `{uptime_str}`\n"
-                f"Poll Cycles: `{self.cycle_count}`"
+                f"Poll Cycles: `{self.cycle_count}`\n"
+                f"Bandwidth: `{self.guard.summary()}`"
             ),
             inline=True,
         )
@@ -751,11 +801,11 @@ class RobloxAuditLoggerClient2(commands.Cog):
             value=(
                 f"Tracked Groups: `{total_groups}`\n"
                 f"Total Servers: `{len(self.bot.guilds)}`\n"
-                f"Proxy Status: `{self._proxy_status()}`"
+                f"WebSocket Status: `{'Closed' if self.bot.is_closed() else 'Connected'}`"
             ),
             inline=False,
         )
-        embed.set_footer(text=format_footer_timestamp(now))
+        embed.set_footer(text=format_footer_timestamp())
         await interaction.followup.send(embed=embed, ephemeral=not visible)
 
     @app_commands.command(
@@ -767,37 +817,43 @@ class RobloxAuditLoggerClient2(commands.Cog):
         if not is_authorized_user(interaction.user.id):
             return await self._deny(interaction)
 
-        embed = self._embed(
-            "TGE Logs - Usage Guide",
-            "Use the commands below to configure and monitor Roblox group audit events.",
-            PURPLE_COLOR,
-            [
-                (
-                    "Available Commands",
-                    "- **/ping**\n"
-                    "  View system status, ping latency, uptime, and tracking stats.\n\n"
-                    "- **/setup `[channel]` `[group]`**\n"
-                    "  Tracks all events for all ranks in the group.\n\n"
-                    "- **/rank-setup `[channel]` `[group]` `[min_rank_name]`**\n"
-                    "  Tracks events exclusively for members at or above a specific rank.\n\n"
-                    "- **/remove-setup `[group]`**\n"
-                    "  Stops logging for a specific group.\n\n"
-                    "- **/list-setups**\n"
-                    "  Displays all configured group logs in this server.",
-                ),
-                (
-                    "Good to Know",
-                    "- **Public polling cap**: only the first 200 members of each rank are scanned, and join/leave events are skipped for ranks larger than that.\n"
-                    "- **Rank filters in public polling**: someone promoted into the tracked ranks shows as a join, and someone demoted out of them shows as a leave. Audit Log mode does not have this limit.\n"
-                    "- **Case-insensitive rank names**: type the rank title as shown on Roblox.",
-                ),
-            ],
+        embed = discord.Embed(
+            title="TGE Logs - Usage Guide",
+            description="Use the commands below to configure and monitor Roblox group audit events.",
+            color=PURPLE_COLOR,
         )
+        embed.add_field(
+            name="Available Commands",
+            value=(
+                "- **/ping**\n"
+                "  View system status, ping latency, uptime, and tracking stats.\n\n"
+                "- **/setup `[channel]` `[group]`**\n"
+                "  Tracks all events for all ranks in the group.\n\n"
+                "- **/rank-setup `[channel]` `[group]` `[min_rank_name]`**\n"
+                "  Tracks events exclusively for members at or above a specific rank.\n\n"
+                "- **/remove-setup `[group]`**\n"
+                "  Stops logging for a specific group.\n\n"
+                "- **/list-setups**\n"
+                "  Displays all configured group logs in this server."
+            ),
+            inline=False,
+        )
+        embed.add_field(
+            name="Optimization Advice (Large Groups 1,000+ Members)",
+            value=(
+                "- **Avoid using `/setup` on massive groups** without a cookie attached. Fetching thousands of bottom-rank members triggers Roblox API rate limits.\n"
+                "- **Use `/rank-setup` instead**: Set `min_rank_name` to a stable staff or middle-tier rank.\n"
+                "- **Case-Insensitive Exact Names**: When entering `min_rank_name`, type the exact rank title as shown on Roblox.\n"
+                "- **Public polling cap**: only the first 200 members of each rank are scanned, and join/leave events are skipped for ranks larger than that."
+            ),
+            inline=False,
+        )
+        embed.set_footer(text=format_footer_timestamp())
         await interaction.response.send_message(embed=embed, ephemeral=not visible)
 
     @app_commands.command(
         name="setup",
-        description="Setup Roblox Group activity logging for ALL ranks."
+        description="Setup Roblox Group activity logging for ALL ranks (Authorized Owners Only)."
     )
     @app_commands.guild_only()
     @app_commands.describe(
@@ -822,7 +878,7 @@ class RobloxAuditLoggerClient2(commands.Cog):
     @app_commands.describe(
         channel="The text channel where logs should be sent",
         group="The Roblox Group ID or full Group Link to track",
-        min_rank_name="The exact rank name to start logging from",
+        min_rank_name="The exact rank name to start logging from (e.g. Officer)",
         visible="Set to True to make the response visible to everyone (default: False).",
     )
     async def rank_setup_cmd(
@@ -837,7 +893,7 @@ class RobloxAuditLoggerClient2(commands.Cog):
 
     @app_commands.command(
         name="remove-setup",
-        description="Remove a Roblox Group audit setup from this server."
+        description="Remove a Roblox Group audit setup from this server (Authorized Owners Only)."
     )
     @app_commands.guild_only()
     @app_commands.describe(
@@ -861,24 +917,26 @@ class RobloxAuditLoggerClient2(commands.Cog):
         if db is None:
             return await reply(error_embed("Database Error", "Could not connect to MongoDB Atlas."))
 
-        deleted = await db["group_configs"].find_one_and_delete(
-            {"guild_id": str(interaction.guild.id), "group_id": group_id}
-        )
+        guild_id = str(interaction.guild.id)
+        deleted = await db["group_configs"].find_one_and_delete({"guild_id": guild_id, "group_id": group_id})
         if not deleted:
-            return await reply(self._embed("Not Found", f"No configuration found for Group ID `{group_id}`.", RED_COLOR))
+            return await reply(error_embed("Not Found", f"No configuration found for Group ID `{group_id}`."))
 
         # Clean up in-memory state for the removed config
         key = deleted["_id"]
         self.group_trackers.pop(key, None)
+        self.member_caches.pop(key, None)
+        self.configs_dirty = True
+        self.initialized_groups.discard((guild_id, group_id))
         task = self.public_tasks.pop(key, None)
         if task:
             task.cancel()
 
-        await reply(self._embed("Setup Removed", f"Stopped tracking Group ID `{group_id}`.", GREEN_COLOR))
+        await reply(self._make_embed("Setup Removed", f"Stopped tracking Group ID `{group_id}`.", GREEN_COLOR))
 
     @app_commands.command(
         name="list-setups",
-        description="List active group configurations."
+        description="List active group configurations (Authorized Owners Only)."
     )
     @app_commands.guild_only()
     @app_commands.describe(visible="Set to True to make the response visible to everyone (default: False).")
@@ -912,7 +970,7 @@ class RobloxAuditLoggerClient2(commands.Cog):
             description = description[:3990].rsplit("\n", 1)[0] + "\n*(list truncated)*"
 
         await interaction.followup.send(
-            embed=self._embed("TGE Logs - Server Configurations", description, PURPLE_COLOR),
+            embed=self._make_embed("TGE Logs - Server Configurations", description, PURPLE_COLOR),
             ephemeral=not visible,
         )
 
@@ -936,23 +994,47 @@ class RobloxAuditLoggerClient2(commands.Cog):
         await self.bot.wait_until_ready()
         self.last_cycle_at = time.time()
 
+    @tasks.loop(seconds=60.0)
+    async def watchdog_task(self):
+        """Restarts the poll loop if it stopped or got stuck."""
+        try:
+            if not self.poll_logs_task.is_running():
+                log.error("Poll loop was not running. Starting it again.")
+                self.poll_logs_task.start()
+            elif time.time() - self.last_cycle_at > 180:
+                log.error("Poll loop looks stuck (no cycle for 180s). Restarting it.")
+                self.poll_logs_task.restart()
+        except Exception:
+            log.exception("Watchdog failed")
+
+    @watchdog_task.before_loop
+    async def before_watchdog_task(self):
+        await self.bot.wait_until_ready()
+        await asyncio.sleep(90)
+
     async def _poll_cycle(self):
         db = get_db()
         if db is None:
             return
 
-        session = await self.get_http_session()
-        configs = await db["group_configs"].find().to_list(length=1000)
+        await self._sync_usage(db)
+        multiplier = self.guard.multiplier()
+        self._note_guard_state(multiplier)
         self.cycle_count += 1
+        if multiplier is None:
+            return  # Monthly bandwidth budget is used up: stay quiet until next month
+
+        session = await self.get_http_session()
+        configs = await self._get_configs(db)
 
         for cfg in configs:
             # One bad group must never stop the others
             try:
-                await self._poll_one(db, session, cfg)
+                await self._poll_one(db, session, cfg, multiplier)
             except Exception:
                 log.exception("Polling failed for group %s", cfg.get("group_id"))
 
-    async def _poll_one(self, db, session, cfg):
+    async def _poll_one(self, db, session, cfg, multiplier: float = 1.0):
         group_id = cfg.get("group_id")
         group_name = cfg.get("group_name", "Roblox Group")
         channel_id = cfg.get("channel_id")
@@ -973,15 +1055,15 @@ class RobloxAuditLoggerClient2(commands.Cog):
             tracker = self.group_trackers[key] = GroupTracker(group_id)
 
         if mode == "audit_log":
-            # Throttle so many groups do not hit the audit-log endpoint every 10s
-            if time.time() - tracker.last_polled < AUDIT_POLL_INTERVAL:
+            # Throttle so many groups do not hammer the audit-log endpoint every 10s
+            if time.time() - tracker.last_polled < AUDIT_POLL_INTERVAL * multiplier:
                 return
             tracker.last_polled = time.time()
             await self.poll_audit_log_mode(db, session, cfg, channel, group_id, group_name, min_rank_val)
             return
 
         # Public polling: only when due, and never two at once for the same config
-        if key in self.public_tasks or not tracker.is_due():
+        if key in self.public_tasks or not tracker.is_due(multiplier):
             return
 
         tracker.last_polled = time.time()  # Claim the slot so the next tick does not start a duplicate
@@ -1002,20 +1084,18 @@ class RobloxAuditLoggerClient2(commands.Cog):
     async def poll_audit_log_mode(self, db, session, cfg, channel, group_id, group_name, min_rank_val):
         url = f"https://groups.roblox.com/v1/groups/{group_id}/audit-log?limit=25&sortOrder=Desc"
 
+        self._count_request()
         try:
-            async with session.get(url, headers=self._headers_for(url)) as resp:
+            async with session.get(url) as resp:
                 status = resp.status
-                body = await resp.json(content_type=None) if status == 200 else None
+                body = await resp.json() if status == 200 else None
         except Exception:
             log.warning("Audit log request failed for group %s", group_id, exc_info=True)
             return
 
         if status in (401, 403):
             log.warning("Audit log returned %s for group %s. Switching it to public polling.", status, group_id)
-            await db["group_configs"].update_one(
-                {"_id": cfg["_id"]},
-                {"$set": {"mode": "public_polling"}, "$unset": {"last_audit_id": ""}},
-            )
+            await self._update_config(db, cfg, {"mode": "public_polling"}, unset=["last_audit_id"])
             return
 
         if status != 200 or not body:
@@ -1025,13 +1105,14 @@ class RobloxAuditLoggerClient2(commands.Cog):
         if not logs:
             return
 
+        sync_key = (cfg.get("guild_id"), group_id)
         last_key = cfg.get("last_audit_id")
+        latest_key = audit_entry_key(logs[0])
 
-        # No watermark yet: set it without logging old entries
-        if last_key is None:
-            await db["group_configs"].update_one(
-                {"_id": cfg["_id"]}, {"$set": {"last_audit_id": audit_entry_key(logs[0])}}
-            )
+        # RE-DEPLOYMENT / FIRST RUN SYNC: set the watermark without logging old entries
+        if sync_key not in self.initialized_groups or last_key is None:
+            await self._update_config(db, cfg, {"last_audit_id": latest_key})
+            self.initialized_groups.add(sync_key)
             return
 
         last_key = str(last_key)
@@ -1044,10 +1125,7 @@ class RobloxAuditLoggerClient2(commands.Cog):
         if not new_logs:
             return
 
-        await db["group_configs"].update_one(
-            {"_id": cfg["_id"]},
-            {"$set": {"last_audit_id": audit_entry_key(new_logs[0])}},
-        )
+        await self._update_config(db, cfg, {"last_audit_id": audit_entry_key(new_logs[0])})
 
         for entry in reversed(new_logs):
             try:
@@ -1056,7 +1134,7 @@ class RobloxAuditLoggerClient2(commands.Cog):
                 log.exception("Failed to format audit entry for group %s", group_id)
 
     async def poll_public_mode(self, db, cfg, channel, group_id, group_name, min_rank_val, tracker: GroupTracker):
-        cached_members: Dict[str, Dict[str, Any]] = cfg.get("member_cache") or {}
+        key = cfg["_id"]
         has_changes = False
 
         try:
@@ -1066,48 +1144,77 @@ class RobloxAuditLoggerClient2(commands.Cog):
             if not is_complete or not current_members:
                 return
 
-            # First run: record the baseline without announcing existing members
-            if not cached_members:
-                await db["group_configs"].update_one({"_id": cfg["_id"]}, {"$set": {"member_cache": current_members}})
-                return
+            entry = self.member_caches.get(key)
+            cached_members: Dict[str, Dict[str, Any]] = entry["members"] if entry else {}
 
-            events, updated_cache = diff_members(cached_members, current_members, truncated, min_rank_val)
-
-            # A huge batch almost always means the saved baseline is stale (long downtime)
-            if len(events) > MAX_EVENTS_PER_POLL:
-                log.warning(
-                    "Group %s: %s changes at once, refreshing the baseline instead of posting them.",
-                    group_id, len(events),
-                )
-                await db["group_configs"].update_one({"_id": cfg["_id"]}, {"$set": {"member_cache": updated_cache}})
-                await self._post(channel, self._embed(
-                    "Group Activity",
-                    f"{len(events)} membership changes were detected at once, so they were not listed individually.",
-                    PURPLE_COLOR,
-                    [("Group", f"[{group_name}](https://www.roblox.com/groups/{group_id})")],
-                ))
-                has_changes = True
+            # FIRST RUN / RESTART / RANK-FILTER CHANGE: silently build the baseline in memory
+            if not entry or entry["min"] != min_rank_val or not cached_members:
+                self.member_caches[key] = {"min": min_rank_val, "members": current_members}
                 return
 
             group_link = f"[{group_name}](https://www.roblox.com/groups/{group_id})"
+            updated_cache = dict(cached_members)
 
-            for kind, uid, info, old in events:
-                source = info if info is not None else old
-                name = source.get("username") or f"User {uid}"
-                embed = self._event_embed(
-                    kind,
-                    name,
-                    user_link(name, uid),
-                    group_link,
-                    new_role=info.get("role_name") if info else None,
-                    old_role=old.get("role_name", "Unknown") if old else None,
+            # 1. NEW JOINS & RANK CHANGES
+            for uid, info in current_members.items():
+                target_user = info.get("username") or f"User {uid}"
+                target_link = user_link(target_user, uid)
+                user_rank = info.get("rank", 0)
+                role_name = info.get("role_name", "Unknown")
+
+                if uid not in cached_members:
+                    # In a truncated role, "new" members may just have slid into view
+                    if role_name in truncated:
+                        continue
+
+                    has_changes = True
+                    updated_cache[uid] = info
+                    await self._send(
+                        channel,
+                        self._event_embed("join", target_user, target_link, group_link, new_role=role_name),
+                    )
+                    continue
+
+                old_info = cached_members[uid]
+                if old_info.get("role_name") == info.get("role_name"):
+                    continue
+
+                has_changes = True
+                updated_cache[uid] = info
+
+                kind = "demotion" if user_rank < old_info.get("rank", 0) else "promotion"
+                await self._send(
+                    channel,
+                    self._event_embed(
+                        kind, target_user, target_link, group_link,
+                        new_role=role_name, old_role=old_info.get("role_name", "Unknown"),
+                    ),
+                    react="🎉" if kind == "promotion" else None,
                 )
-                await self._post(channel, embed, react="🎉" if kind == "promotion" else None)
 
-            if updated_cache != cached_members:
-                await db["group_configs"].update_one({"_id": cfg["_id"]}, {"$set": {"member_cache": updated_cache}})
+            # 2. LEAVES / EXILES
+            for uid, old_info in list(cached_members.items()):
+                if uid in current_members:
+                    continue
+                if old_info.get("role_name") in truncated:
+                    continue  # Probably just outside the visible window
+                if old_info.get("rank", 0) < min_rank_val:
+                    continue
 
-            has_changes = bool(events)
+                has_changes = True
+                updated_cache.pop(uid, None)
+
+                target_user = old_info.get("username") or f"User {uid}"
+                await self._send(
+                    channel,
+                    self._event_embed(
+                        "leave", target_user, user_link(target_user, uid), group_link,
+                        old_role=old_info.get("role_name", "Unknown"),
+                    ),
+                )
+
+            # Remember the new roster in memory (nothing is written to the database)
+            self.member_caches[key] = {"min": min_rank_val, "members": updated_cache}
 
         except Exception:
             log.exception("Public polling failed for group %s", group_id)
@@ -1164,7 +1271,7 @@ class RobloxAuditLoggerClient2(commands.Cog):
                 kind, target_user, target_link, group_link, event_dt,
                 new_role=str(new_role), old_role=str(old_role),
             )
-            await self._post(channel, embed, react="🎉" if kind == "promotion" else None)
+            await self._send(channel, embed, react="🎉" if kind == "promotion" else None)
 
         elif action_type in ("Accept Join Request", "Join Group"):
             role_name = description.get("NewRoleSetHeader", description.get("RoleSetName", "Member"))
@@ -1177,10 +1284,8 @@ class RobloxAuditLoggerClient2(commands.Cog):
             target_user = description.get("TargetHeader", description.get("TargetName", actor_name))
             target_link = user_link(target_user, description.get("TargetId", actor_id))
 
-            embed = self._event_embed(
-                "join", target_user, target_link, group_link, event_dt, new_role=str(role_name)
-            )
-            await self._post(channel, embed)
+            embed = self._event_embed("join", target_user, target_link, group_link, event_dt, new_role=str(role_name))
+            await self._send(channel, embed)
 
         elif action_type in ("Remove Member", "Exile Member"):
             if min_rank_val > 0:
@@ -1190,21 +1295,21 @@ class RobloxAuditLoggerClient2(commands.Cog):
             target_link = user_link(target_user, description.get("TargetId"))
 
             embed = self._event_embed("exile", target_user, target_link, group_link, event_dt)
-            await self._post(channel, embed)
+            await self._send(channel, embed)
 
         else:
             if min_rank_val > 0:
                 return
 
-            embed = self._embed(
+            embed = self._make_embed(
                 "Group Activity",
                 f"An activity occurred in the group\n\n**Action**: `{action_type}`",
                 PURPLE_COLOR,
                 [("Performer", user_link(actor_name, actor_id)), ("Group", group_link)],
                 event_dt,
             )
-            await self._post(channel, embed)
+            await self._send(channel, embed)
 
 
 async def setup(bot: commands.Bot):
-    await bot.add_cog(RobloxAuditLoggerClient2(bot))
+    await bot.add_cog(RobloxAuditLogger(bot))
